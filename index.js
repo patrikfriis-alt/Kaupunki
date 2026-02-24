@@ -5,18 +5,11 @@ const RSS_URL = 'https://kokkola10.oncloudos.com/cgi/DREQUEST.PHP?page=rss/offic
 
 const server = http.createServer((req, res) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
-  res.setHeader('Content-Type', 'application/xml; charset=utf-8');
 
   https.get(RSS_URL, (rssRes) => {
-    const chunks = [];
-    rssRes.on('data', chunk => chunks.push(chunk));
-    rssRes.on('end', () => {
-      const buffer = Buffer.concat(chunks);
-      const text = buffer.toString('latin1')
-        .replace(/encoding="[^"]+"/i, 'encoding="utf-8"');
-      const utf8 = Buffer.from(text, 'latin1');
-      res.end(utf8);
-    });
+    const contentType = rssRes.headers['content-type'] || 'application/xml';
+    res.setHeader('Content-Type', contentType);
+    rssRes.pipe(res);
   }).on('error', (e) => {
     res.statusCode = 500;
     res.end('Error: ' + e.message);
