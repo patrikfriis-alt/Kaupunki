@@ -8,6 +8,7 @@ const FEEDS = {
 
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_KEY = process.env.SUPABASE_KEY;
+const SUPABASE_SERVICE_KEY = process.env.SUPABASE_SERVICE_KEY || SUPABASE_KEY;
 
 function fetchRSS(url) {
   return new Promise((resolve, reject) => {
@@ -31,10 +32,10 @@ function parseRSS(buffer) {
       return m ? (m[1] || m[2] || '').trim() : '';
     };
     items.push({
-      otsikko:    get('title'),
-      kuvaus:     get('description'),
-      linkki:     get('link'),
-      julkaistu:  get('pubDate'),
+      otsikko:     get('title'),
+      kuvaus:      get('description'),
+      linkki:      get('link'),
+      julkaistu:   get('pubDate'),
       ulkoinen_id: get('guid') || get('link')
     });
   }
@@ -42,7 +43,7 @@ function parseRSS(buffer) {
 }
 
 async function saveToSupabase(items, tyyppi) {
-  if (!SUPABASE_URL || !SUPABASE_KEY) return;
+  if (!SUPABASE_URL || !SUPABASE_SERVICE_KEY) return;
 
   for (const item of items) {
     let julkaisija = 'Kokkola';
@@ -62,9 +63,9 @@ async function saveToSupabase(items, tyyppi) {
     const body = JSON.stringify({
       ulkoinen_id: item.ulkoinen_id,
       otsikko,
-      kuvaus:     item.kuvaus,
+      kuvaus:    item.kuvaus,
       julkaisija,
-      linkki:     item.linkki,
+      linkki:    item.linkki,
       julkaistu,
       tyyppi
     });
@@ -73,13 +74,13 @@ async function saveToSupabase(items, tyyppi) {
       const url = new URL(`${SUPABASE_URL}/rest/v1/paatokset`);
       const options = {
         hostname: url.hostname,
-        path: url.pathname + '?on_conflict=ulkoinen_id',
-        method: 'POST',
+        path:     url.pathname + '?on_conflict=ulkoinen_id',
+        method:   'POST',
         headers: {
-          'Content-Type': 'application/json',
-          'apikey': SUPABASE_KEY,
-          'Authorization': `Bearer ${SUPABASE_KEY}`,
-          'Prefer': 'resolution=merge-duplicates',
+          'Content-Type':   'application/json',
+          'apikey':         SUPABASE_SERVICE_KEY,
+          'Authorization':  `Bearer ${SUPABASE_SERVICE_KEY}`,
+          'Prefer':         'resolution=merge-duplicates',
           'Content-Length': Buffer.byteLength(body)
         }
       };
