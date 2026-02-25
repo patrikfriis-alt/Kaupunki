@@ -3,7 +3,8 @@ const http = require('http');
 
 const FEEDS = {
   '/decisions': 'https://kokkola10.oncloudos.com/cgi/DREQUEST.PHP?page=rss/official_decisions&show=30',
-  '/meetings':  'https://kokkola10.oncloudos.com/cgi/DREQUEST.PHP?page=rss/meetingitems&show=30'
+  '/meetings':  'https://kokkola10.oncloudos.com/cgi/DREQUEST.PHP?page=rss/meetingitems&show=30',
+  '/agendas':   'https://kokkola10.oncloudos.com/cgi/DREQUEST.PHP?page=rss/meetings&show=10'
 };
 
 const SUPABASE_URL = process.env.SUPABASE_URL;
@@ -98,6 +99,7 @@ async function saveToSupabase(items, tyyppi) {
 async function syncFeeds() {
   console.log('Syncing feeds to Supabase...');
   for (const [path, url] of Object.entries(FEEDS)) {
+    if (path === '/agendas') continue;
     const tyyppi = path === '/decisions' ? 'paatos' : 'kokous';
     const buffer = await fetchRSS(url);
     const items = parseRSS(buffer);
