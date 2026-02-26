@@ -3,7 +3,7 @@ const http = require('http');
 
 const FEEDS = {
   '/decisions': 'https://kokkola10.oncloudos.com/cgi/DREQUEST.PHP?page=rss/official_decisions&show=30',
-  '/meetings':  'https://kokkola10.oncloudos.com/cgi/DREQUEST.PHP?page=rss/meetingitems&show=30',
+  '/meetings':  'https://kokkola10.oncloudos.com/cgi/DREQUEST.PHP?page=rss/meetingitems&show=100',
   '/agendas':   'https://kokkola10.oncloudos.com/cgi/DREQUEST.PHP?page=rss/meetings&show=10'
 };
 
