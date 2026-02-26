@@ -118,8 +118,7 @@ const server = http.createServer((req, res) => {
 
   const feedUrl = FEEDS[req.url] || FEEDS['/decisions'];
   https.get(feedUrl, (rssRes) => {
-    const contentType = rssRes.headers['content-type'] || 'application/xml';
-    res.setHeader('Content-Type', contentType);
+    res.setHeader('Content-Type', 'application/xml; charset=iso-8859-1');
     rssRes.pipe(res);
   }).on('error', (e) => {
     res.statusCode = 500;
