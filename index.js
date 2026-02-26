@@ -10,12 +10,16 @@ const FEEDS = {
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_KEY = process.env.SUPABASE_KEY;
 const SUPABASE_SERVICE_KEY = process.env.SUPABASE_SERVICE_KEY || SUPABASE_KEY;
+const ANTHROPIC_KEY = process.env.ANTHROPIC_API_KEY;
 
-function fetchRSS(url) {
+// ── HTTP helpers ──────────────────────────────────────────────────────────────
+
+function fetchBuffer(url) {
   return new Promise((resolve, reject) => {
-    https.get(url, (res) => {
+    const mod = url.startsWith('https') ? https : http;
+    mod.get(url, res => {
       const chunks = [];
-      res.on('data', chunk => chunks.push(chunk));
+      res.on('data', c => chunks.push(c));
       res.on('end', () => resolve(Buffer.concat(chunks)));
     }).on('error', reject);
   });
@@ -28,7 +32,7 @@ function parseRSS(buffer) {
   let match;
   while ((match = itemRegex.exec(text)) !== null) {
     const item = match[1];
-    const get = (tag) => {
+    const get = tag => {
       const m = item.match(new RegExp(`<${tag}[^>]*><!\\[CDATA\\[([\\s\\S]*?)\\]\\]><\\/${tag}>|<${tag}[^>]*>([^<]*)<\\/${tag}>`));
       return m ? (m[1] || m[2] || '').trim() : '';
     };
@@ -43,9 +47,37 @@ function parseRSS(buffer) {
   return items;
 }
 
+// ── Supabase ──────────────────────────────────────────────────────────────────
+
+function supabaseRequest(path, method, body) {
+  return new Promise((resolve, reject) => {
+    const bodyStr = JSON.stringify(body);
+    const url = new URL(`${SUPABASE_URL}/rest/v1/${path}`);
+    const options = {
+      hostname: url.hostname,
+      path:     url.pathname + url.search,
+      method,
+      headers: {
+        'Content-Type':   'application/json',
+        'apikey':         SUPABASE_SERVICE_KEY,
+        'Authorization':  `Bearer ${SUPABASE_SERVICE_KEY}`,
+        'Prefer':         'resolution=merge-duplicates',
+        'Content-Length': Buffer.byteLength(bodyStr)
+      }
+    };
+    const req = https.request(options, res => {
+      const chunks = [];
+      res.on('data', c => chunks.push(c));
+      res.on('end', () => resolve(Buffer.concat(chunks).toString()));
+    });
+    req.on('error', reject);
+    req.write(bodyStr);
+    req.end();
+  });
+}
+
 async function saveToSupabase(items, tyyppi) {
   if (!SUPABASE_URL || !SUPABASE_SERVICE_KEY) return;
-
   for (const item of items) {
     let julkaisija = 'Kokkola';
     let otsikko = item.otsikko;
@@ -54,59 +86,176 @@ async function saveToSupabase(items, tyyppi) {
       julkaisija = parts[0].trim();
       otsikko = parts.slice(1).join(' / ').trim();
     }
-
     let julkaistu = null;
     if (item.julkaistu) {
       const d = new Date(item.julkaistu);
       if (!isNaN(d)) julkaistu = d.toISOString().split('T')[0];
     }
-
-    const body = JSON.stringify({
-      ulkoinen_id: item.ulkoinen_id,
-      otsikko,
-      kuvaus:    item.kuvaus,
-      julkaisija,
-      linkki:    item.linkki,
-      julkaistu,
-      tyyppi
-    });
-
-    await new Promise((resolve) => {
-      const url = new URL(`${SUPABASE_URL}/rest/v1/paatokset`);
-      const options = {
-        hostname: url.hostname,
-        path:     url.pathname + '?on_conflict=ulkoinen_id',
-        method:   'POST',
-        headers: {
-          'Content-Type':   'application/json',
-          'apikey':         SUPABASE_SERVICE_KEY,
-          'Authorization':  `Bearer ${SUPABASE_SERVICE_KEY}`,
-          'Prefer':         'resolution=merge-duplicates',
-          'Content-Length': Buffer.byteLength(body)
-        }
-      };
-      const req = https.request(options, (res) => {
-        res.on('data', () => {});
-        res.on('end', resolve);
-      });
-      req.on('error', resolve);
-      req.write(body);
-      req.end();
-    });
+    await supabaseRequest(
+      'paatokset?on_conflict=ulkoinen_id',
+      'POST',
+      { ulkoinen_id: item.ulkoinen_id, otsikko, kuvaus: item.kuvaus, julkaisija, linkki: item.linkki, julkaistu, tyyppi }
+    );
   }
 }
+
+// ── Anthropic API ─────────────────────────────────────────────────────────────
+
+function callClaude(messages, systemPrompt) {
+  return new Promise((resolve, reject) => {
+    const body = JSON.stringify({
+      model: 'claude-haiku-4-5-20251001',
+      max_tokens: 1024,
+      system: systemPrompt,
+      messages
+    });
+    const options = {
+      hostname: 'api.anthropic.com',
+      path:     '/v1/messages',
+      method:   'POST',
+      headers: {
+        'Content-Type':      'application/json',
+        'x-api-key':         ANTHROPIC_KEY,
+        'anthropic-version': '2023-06-01',
+        'Content-Length':    Buffer.byteLength(body)
+      }
+    };
+    const req = https.request(options, res => {
+      const chunks = [];
+      res.on('data', c => chunks.push(c));
+      res.on('end', () => {
+        try {
+          const data = JSON.parse(Buffer.concat(chunks).toString());
+          resolve(data.content?.[0]?.text || '');
+        } catch(e) { reject(e); }
+      });
+    });
+    req.on('error', reject);
+    req.write(body);
+    req.end();
+  });
+}
+
+// ── PDF-parsinta taloustiedoille ──────────────────────────────────────────────
+
+async function parsePdfWithClaude(pdfUrl, kokousId, kokousPvm) {
+  if (!ANTHROPIC_KEY) return;
+  console.log('Parsing PDF:', pdfUrl);
+  try {
+    const pdfBuffer = await fetchBuffer(pdfUrl);
+    const pdfBase64 = pdfBuffer.toString('base64');
+
+    const result = await callClaude([
+      {
+        role: 'user',
+        content: [
+          {
+            type: 'document',
+            source: { type: 'base64', media_type: 'application/pdf', data: pdfBase64 }
+          },
+          {
+            type: 'text',
+            text: 'Lue tämä Kokkolan kaupungin kokousasiakirja ja poimii kaikki taloudelliset ja henkilöstötiedot. Palauta VAIN JSON-objekti ilman mitään muuta tekstiä tai markdown-merkkejä, esimerkiksi: {"tyyppi":"talous","vuosi":2026,"tulos_milj_eur":-5.2,"tulot_milj_eur":120.5,"menot_milj_eur":125.7,"investoinnit_milj_eur":15.0,"lisatiedot":"lyhyt yhteenveto"} tai henkilöstöraportille: {"tyyppi":"henkilosto","vuosi":2026,"kuukausi":11,"henkilovahvuus":2646,"vakinaiset":1807,"maaraikaiset":380,"sijaiset":277,"sairauspoissaolo_pct":7.1,"lisatiedot":"lyhyt yhteenveto"}. Jos dokumentti ei sisällä talous- tai henkilöstötietoja, palauta {"tyyppi":"ei_relevantti"}.'
+          }
+        ]
+      }
+    ], 'Olet Kokkolan kaupungin taloushallinnon asiantuntija. Poimit dataa dokumenteista tarkasti JSON-muodossa.');
+
+    const clean = result.replace(/```json|```/g, '').trim();
+    const data = JSON.parse(clean);
+
+    if (data.tyyppi && data.tyyppi !== 'ei_relevantti') {
+      await supabaseRequest(
+        'talousdata?on_conflict=kokous_id',
+        'POST',
+        { kokous_id: kokousId, kokous_pvm: kokousPvm, raportti_tyyppi: data.tyyppi, data }
+      );
+      console.log('Saved talousdata for', kokousId, data.tyyppi);
+    }
+  } catch(e) {
+    console.error('PDF parse error:', e.message);
+  }
+}
+
+// ── Kaupunginhallituksen PDF-asiakirjojen tarkistus ───────────────────────────
+
+async function checkKaupunginhallitusPdfs() {
+  if (!ANTHROPIC_KEY) return;
+  console.log('Checking kaupunginhallitus PDFs...');
+  try {
+    const buffer = await fetchBuffer(FEEDS['/meetings']);
+    const items = parseRSS(buffer);
+
+    // Etsi kaupunginhallituksen kokousasiat
+    const khItems = items.filter(item =>
+      item.otsikko.toLowerCase().includes('kaupunginhallitus')
+    );
+
+    for (const item of khItems.slice(0, 5)) {
+      // Poimi ID linkistä: ?page=meetingitem&id=20261111-7
+      const idMatch = item.linkki.match(/id=(\d+-\d+)/);
+      if (!idMatch) continue;
+      const id = idMatch[1];
+      const pdfUrl = `https://kokkola10.oncloudos.com/kokous/${id}.PDF`;
+
+      // Tarkista onko jo käsitelty
+      const existing = await new Promise(resolve => {
+        const url = new URL(`${SUPABASE_URL}/rest/v1/talousdata?kokous_id=eq.${id}&select=id`);
+        const options = {
+          hostname: url.hostname,
+          path: url.pathname + url.search,
+          method: 'GET',
+          headers: {
+            'apikey': SUPABASE_SERVICE_KEY,
+            'Authorization': `Bearer ${SUPABASE_SERVICE_KEY}`
+          }
+        };
+        https.get(options, res => {
+          const chunks = [];
+          res.on('data', c => chunks.push(c));
+          res.on('end', () => {
+            try { resolve(JSON.parse(Buffer.concat(chunks).toString())); }
+            catch { resolve([]); }
+          });
+        }).on('error', () => resolve([]));
+      });
+
+      if (existing.length > 0) {
+        console.log('Already processed:', id);
+        continue;
+      }
+
+      // Poimi päivämäärä otsikosta
+      const dateMatch = item.otsikko.match(/(\d{1,2})\.(\d{1,2})\.(\d{4})/);
+      const kokousPvm = dateMatch
+        ? `${dateMatch[3]}-${dateMatch[2].padStart(2,'0')}-${dateMatch[1].padStart(2,'0')}`
+        : null;
+
+      await parsePdfWithClaude(pdfUrl, id, kokousPvm);
+      // Pieni viive ettei API-rajoja ylitetä
+      await new Promise(r => setTimeout(r, 2000));
+    }
+  } catch(e) {
+    console.error('checkKaupunginhallitusPdfs error:', e.message);
+  }
+}
+
+// ── Pääsynkronointi ───────────────────────────────────────────────────────────
 
 async function syncFeeds() {
   console.log('Syncing feeds to Supabase...');
   for (const [path, url] of Object.entries(FEEDS)) {
     if (path === '/agendas') continue;
     const tyyppi = path === '/decisions' ? 'paatos' : 'kokous';
-    const buffer = await fetchRSS(url);
+    const buffer = await fetchBuffer(url);
     const items = parseRSS(buffer);
     await saveToSupabase(items, tyyppi);
     console.log(`Synced ${items.length} items from ${path}`);
   }
+  await checkKaupunginhallitusPdfs();
 }
+
+// ── HTTP-palvelin ─────────────────────────────────────────────────────────────
 
 const server = http.createServer((req, res) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
@@ -116,11 +265,16 @@ const server = http.createServer((req, res) => {
     return;
   }
 
+  if (req.url === '/parse-pdfs') {
+    checkKaupunginhallitusPdfs().then(() => res.end('OK')).catch(e => res.end('Error: ' + e.message));
+    return;
+  }
+
   const feedUrl = FEEDS[req.url] || FEEDS['/decisions'];
-  https.get(feedUrl, (rssRes) => {
+  https.get(feedUrl, rssRes => {
     res.setHeader('Content-Type', 'application/xml; charset=iso-8859-1');
     rssRes.pipe(res);
-  }).on('error', (e) => {
+  }).on('error', e => {
     res.statusCode = 500;
     res.end('Error: ' + e.message);
   });
