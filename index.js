@@ -12,8 +12,6 @@ const SUPABASE_KEY = process.env.SUPABASE_KEY;
 const SUPABASE_SERVICE_KEY = process.env.SUPABASE_SERVICE_KEY || SUPABASE_KEY;
 const ANTHROPIC_KEY = process.env.ANTHROPIC_API_KEY;
 
-// ── HTTP helpers ──────────────────────────────────────────────────────────────
-
 function fetchBuffer(url) {
   return new Promise((resolve, reject) => {
     const mod = url.startsWith('https') ? https : http;
@@ -46,8 +44,6 @@ function parseRSS(buffer) {
   }
   return items;
 }
-
-// ── Supabase ──────────────────────────────────────────────────────────────────
 
 function supabaseRequest(path, method, body) {
   return new Promise((resolve, reject) => {
@@ -99,8 +95,6 @@ async function saveToSupabase(items, tyyppi) {
   }
 }
 
-// ── Anthropic API ─────────────────────────────────────────────────────────────
-
 function callClaude(messages, systemPrompt) {
   return new Promise((resolve, reject) => {
     const body = JSON.stringify({
@@ -136,8 +130,6 @@ function callClaude(messages, systemPrompt) {
   });
 }
 
-// ── PDF-parsinta taloustiedoille ──────────────────────────────────────────────
-
 async function parsePdfWithClaude(pdfUrl, kokousId, kokousPvm) {
   if (!ANTHROPIC_KEY) return;
   console.log('Parsing PDF:', pdfUrl);
@@ -171,13 +163,13 @@ async function parsePdfWithClaude(pdfUrl, kokousId, kokousPvm) {
         { kokous_id: kokousId, kokous_pvm: kokousPvm, raportti_tyyppi: data.tyyppi, data }
       );
       console.log('Saved talousdata for', kokousId, data.tyyppi);
+    } else {
+      console.log('Not relevant:', kokousId);
     }
   } catch(e) {
     console.error('PDF parse error:', e.message);
   }
 }
-
-// ── Kaupunginhallituksen PDF-asiakirjojen tarkistus ───────────────────────────
 
 async function checkKaupunginhallitusPdfs() {
   if (!ANTHROPIC_KEY) return;
@@ -186,21 +178,33 @@ async function checkKaupunginhallitusPdfs() {
     const buffer = await fetchBuffer(FEEDS['/meetings']);
     const items = parseRSS(buffer);
 
-    // Etsi kaupunginhallituksen kokousasiat
+    console.log('Total meetings items:', items.length);
+    console.log('Sample titles:', items.slice(0, 3).map(i => i.otsikko));
+
     const khItems = items.filter(item =>
       item.otsikko.toLowerCase().includes('kaupunginhallitus')
     );
+    console.log('KH items found:', khItems.length);
 
-    for (const item of khItems.slice(0, 5)) {
-      // Poimi ID linkistä: ?page=meetingitem&id=20261111-7
+    // Deduplicate by meeting ID
+    const seen = new Set();
+    const uniqueItems = [];
+    for (const item of khItems) {
       const idMatch = item.linkki.match(/id=(\d+-\d+)/);
       if (!idMatch) continue;
-      const id = idMatch[1];
-      const pdfUrl = `https://kokkola10.oncloudos.com/kokous/${id}.PDF`;
+      const meetingId = idMatch[1].split('-')[0];
+      if (seen.has(meetingId)) continue;
+      seen.add(meetingId);
+      uniqueItems.push({ ...item, meetingId, itemId: idMatch[1] });
+    }
+    console.log('Unique KH meetings:', uniqueItems.length);
+
+    for (const item of uniqueItems.slice(0, 3)) {
+      const pdfUrl = `https://kokkola10.oncloudos.com/kokous/${item.itemId}.PDF`;
 
       // Tarkista onko jo käsitelty
       const existing = await new Promise(resolve => {
-        const url = new URL(`${SUPABASE_URL}/rest/v1/talousdata?kokous_id=eq.${id}&select=id`);
+        const url = new URL(`${SUPABASE_URL}/rest/v1/talousdata?kokous_id=eq.${item.itemId}&select=id`);
         const options = {
           hostname: url.hostname,
           path: url.pathname + url.search,
@@ -221,26 +225,22 @@ async function checkKaupunginhallitusPdfs() {
       });
 
       if (existing.length > 0) {
-        console.log('Already processed:', id);
+        console.log('Already processed:', item.itemId);
         continue;
       }
 
-      // Poimi päivämäärä otsikosta
       const dateMatch = item.otsikko.match(/(\d{1,2})\.(\d{1,2})\.(\d{4})/);
       const kokousPvm = dateMatch
         ? `${dateMatch[3]}-${dateMatch[2].padStart(2,'0')}-${dateMatch[1].padStart(2,'0')}`
         : null;
 
-      await parsePdfWithClaude(pdfUrl, id, kokousPvm);
-      // Pieni viive ettei API-rajoja ylitetä
+      await parsePdfWithClaude(pdfUrl, item.itemId, kokousPvm);
       await new Promise(r => setTimeout(r, 2000));
     }
   } catch(e) {
     console.error('checkKaupunginhallitusPdfs error:', e.message);
   }
 }
-
-// ── Pääsynkronointi ───────────────────────────────────────────────────────────
 
 async function syncFeeds() {
   console.log('Syncing feeds to Supabase...');
@@ -254,8 +254,6 @@ async function syncFeeds() {
   }
   await checkKaupunginhallitusPdfs();
 }
-
-// ── HTTP-palvelin ─────────────────────────────────────────────────────────────
 
 const server = http.createServer((req, res) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
