@@ -168,14 +168,15 @@ async function fetchNews(aihe, query) {
     const result = await callClaude([
       {
         role: 'user',
-        content: 'Hae uusimmat uutiset hakusanalla: "' + query + '". Palauta VAIN JSON-taulukko ilman muuta tekstiä tai markdown-merkkejä, max 8 uutista: [{"otsikko":"...","url":"...","kuvaus":"lyhyt kuvaus","julkaistu":"pp.kk.vvvv"}]. Jos päivämäärää ei löydy käytä tämän päivän päivämäärää.'
+        content: 'Search for the latest news about: ' + query + '. After searching, respond with ONLY a raw JSON array, no explanation, no markdown. Format: [{"otsikko":"title in Finnish","url":"https://...","kuvaus":"short description in Finnish","julkaistu":"dd.mm.yyyy"}]. Include up to 8 results.'
       }
-    ], 'Olet uutishakurobotti. Palauta aina vain JSON-taulukko.', tools);
+    ], 'You are a news search assistant. After using web_search, you MUST respond with ONLY a raw JSON array. No text before or after. No markdown code blocks. Just the JSON array starting with [ and ending with ].', tools);
 
     // Kerää tekstivastaus kaikista content-blokeista
     const textBlocks = (result.content || []).filter(b => b.type === 'text');
     const text = textBlocks.map(b => b.text).join('');
     const clean = text.replace(/```json|```/g, '').trim();
+    console.log('Claude response for', aihe, '(first 300):', clean.slice(0, 300));
 
     let news;
     try {
