@@ -177,6 +177,9 @@ async function fetchNews(aihe, query) {
     const text = textBlocks.map(b => b.text).join('');
     const clean = text.replace(/```json|```/g, '').trim();
     console.log('Claude response for', aihe, '(first 300):', clean.slice(0, 300));
+    console.log('Full result content types:', (result.content || []).map(b => b.type).join(', '));
+    console.log('Result stop reason:', result.stop_reason);
+    if (result.error) console.log('Result error:', JSON.stringify(result.error));
 
     let news;
     try {
