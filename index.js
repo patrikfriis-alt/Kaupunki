@@ -179,10 +179,22 @@ async function fetchNews(aihe, query) {
 
     let news;
     try {
+      // Yritetään ensin suoraan
       news = JSON.parse(clean);
     } catch(e) {
-      console.error('JSON parse error for', aihe, ':', clean.slice(0, 200));
-      return;
+      // Etsitään JSON-taulukko tekstin seasta
+      const match = clean.match(/\[\s*\{[\s\S]*\}\s*\]/);
+      if (match) {
+        try {
+          news = JSON.parse(match[0]);
+        } catch(e2) {
+          console.error('JSON parse error for', aihe, ':', clean.slice(0, 300));
+          return;
+        }
+      } else {
+        console.error('No JSON array found for', aihe, ':', clean.slice(0, 300));
+        return;
+      }
     }
 
     if (!Array.isArray(news)) return;
