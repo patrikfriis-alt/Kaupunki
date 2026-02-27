@@ -168,9 +168,9 @@ async function fetchNews(aihe, query) {
     const result = await callClaude([
       {
         role: 'user',
-        content: 'Search for the latest news about: ' + query + '. After searching, respond with ONLY a raw JSON array, no explanation, no markdown. Format: [{"otsikko":"title in Finnish","url":"https://...","kuvaus":"short description in Finnish","julkaistu":"dd.mm.yyyy"}]. Include up to 8 results.'
+        content: 'Search for the latest news about: ' + query + '. Search multiple times to find news from different sources like news sites, press releases, LinkedIn, and official announcements. After searching, respond with ONLY a raw JSON array, no explanation, no markdown. Format: [{"otsikko":"title in Finnish","url":"https://...","kuvaus":"short description in Finnish max 100 chars","julkaistu":"dd.mm.yyyy"}]. Include up to 8 results from different sources.'
       }
-    ], 'You are a news search assistant. After using web_search, you MUST respond with ONLY a raw JSON array. No text before or after. No markdown code blocks. Just the JSON array starting with [ and ending with ].', tools);
+    ], 'You are a news search assistant. Search broadly for news from many different sources. After using web_search tool (use it 2-3 times with different queries), you MUST respond with ONLY a raw JSON array. No text before or after. No markdown code blocks. Just the JSON array starting with [ and ending with ].', tools);
 
     // Kerää tekstivastaus kaikista content-blokeista
     const textBlocks = (result.content || []).filter(b => b.type === 'text');
@@ -306,9 +306,9 @@ async function checkKaupunginhallitusPdfs() {
 
 async function syncNews() {
   console.log('Syncing news...');
-  await fetchNews('arctial', 'Arctial aluminium Kokkola');
-  await new Promise(r => setTimeout(r, 2000));
-  await fetchNews('kokkola', 'Kokkola kaupunki uutiset 2026');
+  await fetchNews('arctial', 'Arctial alumiinitehdas Kokkola site:yle.fi OR site:keskipohjanmaa.fi OR site:arctial.com OR site:linkedin.com OR site:kauppalehti.fi');
+  await new Promise(r => setTimeout(r, 3000));
+  await fetchNews('kokkola', 'Kokkola uutiset site:yle.fi OR site:keskipohjanmaa.fi OR site:kokkola.fi OR site:pohjalaismediat.fi');
 }
 
 async function syncFeeds() {
