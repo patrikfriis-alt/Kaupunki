@@ -203,14 +203,17 @@ async function fetchNews(aihe, query) {
 
     if (!Array.isArray(news)) return;
 
-    // Tyhjennä vanhat uutiset tälle aiheelle
-    await supabaseRequest('uutiset?aihe=eq.' + aihe, 'DELETE', {});
+    // Tyhjennä vanhat uutiset (arctial2 tallennetaan arctial-aiheeseen)
+    const saveAihe = aihe === 'arctial2' ? 'arctial' : aihe;
+    if (aihe !== 'arctial2') {
+      await supabaseRequest('uutiset?aihe=eq.' + saveAihe, 'DELETE', {});
+    }
 
     // Tallenna uudet
     for (const item of news) {
       if (!item.otsikko || !item.url) continue;
       await supabaseRequest('uutiset', 'POST', {
-        aihe,
+        aihe: saveAihe,
         otsikko: item.otsikko,
         url:     item.url,
         kuvaus:  item.kuvaus || '',
@@ -306,9 +309,11 @@ async function checkKaupunginhallitusPdfs() {
 
 async function syncNews() {
   console.log('Syncing news...');
-  await fetchNews('arctial', 'Arctial alumiinitehdas Kokkola site:yle.fi OR site:keskipohjanmaa.fi OR site:arctial.com OR site:linkedin.com OR site:kauppalehti.fi');
+  await fetchNews('arctial', 'Arctial alumiinitehdas Kokkola 2026');
+  await new Promise(r => setTimeout(r, 2000));
+  await fetchNews('arctial2', 'Arctial Kokkola site:yle.fi OR site:keskipohjanmaa.fi OR site:kauppalehti.fi OR site:talouselama.fi');
   await new Promise(r => setTimeout(r, 3000));
-  await fetchNews('kokkola', 'Kokkola uutiset site:yle.fi OR site:keskipohjanmaa.fi OR site:kokkola.fi OR site:pohjalaismediat.fi');
+  await fetchNews('kokkola', '"Kokkola" uutiset 2026 site:yle.fi OR site:keskipohjanmaa.fi OR site:kokkola.fi');
 }
 
 async function syncFeeds() {
