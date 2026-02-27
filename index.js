@@ -1,585 +1,568 @@
-// ============================================================
-// CONSTANTS
-// ============================================================
+const https = require('https');
+const http = require('http');
+const { URL } = require('url');
 
-const PROXY_BASE        = 'https://kaupunki.onrender.com';
-const PROXY_DECISIONS   = PROXY_BASE + '/decisions';
-const PROXY_MEETINGS    = PROXY_BASE + '/meetings';
-const PROXY_AGENDAS     = PROXY_BASE + '/agendas';
-const STAT_VAESTO_URL   = 'https://pxdata.stat.fi/PxWeb/api/v1/fi/StatFin/vaerak/statfin_vaerak_pxt_11ra.px';
-const STAT_TYO_URL      = 'https://pxdata.stat.fi/PxWeb/api/v1/fi/StatFin/tyonv/statfin_tyonv_pxt_12tf.px';
+// ============================================================================
+// CONFIGURATION & CONSTANTS
+// ============================================================================
 
-// ============================================================
-// STATE
-// ============================================================
+const CONFIG = {
+  CLAUDE_MODEL: 'claude-haiku-4-5-20251001',
+  CLAUDE_MAX_TOKENS: 2048,
+  PDF_MIN_SIZE: 1000,
+  PDF_REQUEST_DELAY_MS: 1500,
+  NEWS_SYNC_INTERVAL_MS: 24 * 60 * 60 * 1000,
+  FEED_SYNC_INTERVAL_MS: 60 * 60 * 1000,
+  HTTP_TIMEOUT_MS: 30000,
+  REQUEST_RETRY_ATTEMPTS: 3,
+  REQUEST_RETRY_DELAY_MS: 1000,
+  PARALLEL_REQUESTS: 5
+};
 
-let activeFilter    = 'all';
-let showAll         = false;
-let activeQuery     = '';
-let allAgendaItems  = [];
-let meetingFilter   = 'tulevat';
-const newsCache     = {};
+const FEEDS = {
+  '/decisions': 'https://kokkola10.oncloudos.com/cgi/DREQUEST.PHP?page=rss/official_decisions&show=30',
+  '/meetings': 'https://kokkola10.oncloudos.com/cgi/DREQUEST.PHP?page=rss/meetingitems&show=100',
+  '/agendas': 'https://kokkola10.oncloudos.com/cgi/DREQUEST.PHP?page=rss/meetings&show=100'
+};
 
-// ============================================================
-// VIEW NAVIGATION
-// ============================================================
+// ============================================================================
+// ENVIRONMENT VALIDATION
+// ============================================================================
 
-function showView(name) {
-  document.querySelectorAll('.view').forEach(v => v.classList.remove('active'));
-  document.getElementById('view-' + name).classList.add('active');
-  document.querySelectorAll('.nav-btn[data-view]').forEach(b => {
-    b.classList.toggle('active', b.dataset.view === name);
-  });
-
-  document.getElementById('nav-search').style.display = name === 'dashboard' ? 'flex' : 'none';
-
-  if (name === 'dashboard') {
-    loadDecisions();
-    loadStats();
-    loadMeetings();
-    loadAgendas();
+function validateEnvironment() {
+  const required = ['SUPABASE_URL', 'SUPABASE_SERVICE_KEY', 'ANTHROPIC_API_KEY'];
+  const missing = required.filter(key => !process.env[key]);
+  if (missing.length > 0) {
+    throw new Error(`Missing required environment variables: ${missing.join(', ')}`);
   }
 }
 
-// ============================================================
-// STATISTICS — Tilastokeskus PxWeb API
-// ============================================================
+const SUPABASE_URL = process.env.SUPABASE_URL;
+const SUPABASE_SERVICE_KEY = process.env.SUPABASE_SERVICE_KEY;
+const ANTHROPIC_KEY = process.env.ANTHROPIC_API_KEY;
+const ALLOWED_ORIGINS = process.env.ALLOWED_ORIGINS?.split(',').map(o => o.trim()) || ['*'];
+const PORT = process.env.PORT || 10000;
 
-async function fetchStat(url, body) {
-  const res = await fetch(url, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(body)
+// ============================================================================
+// LOGGER
+// ============================================================================
+
+const Logger = {
+  info:  (msg, data) => console.log(`[INFO] ${new Date().toISOString()} - ${msg}`, data || ''),
+  error: (msg, err)  => console.error(`[ERROR] ${new Date().toISOString()} - ${msg}`, err?.message || err || ''),
+  warn:  (msg, data) => console.warn(`[WARN] ${new Date().toISOString()} - ${msg}`, data || ''),
+  debug: (msg, data) => { if (process.env.DEBUG) console.log(`[DEBUG] ${new Date().toISOString()} - ${msg}`, data || ''); }
+};
+
+// ============================================================================
+// HTTP UTILITIES
+// ============================================================================
+
+function collectResponse(res) {
+  return new Promise((resolve, reject) => {
+    const chunks = [];
+    const timeout = setTimeout(() => reject(new Error('Response timeout')), CONFIG.HTTP_TIMEOUT_MS);
+    res.on('data', c => chunks.push(c));
+    res.on('end', () => { clearTimeout(timeout); resolve(Buffer.concat(chunks)); });
+    res.on('error', err => { clearTimeout(timeout); reject(err); });
   });
-  const data = await res.json();
-  return parseFloat(data.data[0]?.values[0]);
 }
 
-async function loadStats() {
-  // Väestö ja alle 18-v
-  const statDefs = [
-    { tiedot: 'vaesto',          elValue: 'stat-vaesto',    elChange: 'stat-vaesto-change',  format: v => Math.round(v).toLocaleString('fi-FI'), unit: 'hlö' },
-    { tiedot: 'vaesto_alle15_p', elValue: 'stat-nuoret',    elChange: 'stat-nuoret-change',  format: v => v.toFixed(1) + '%',                    unit: '%'   },
-  ];
+function sleep(ms) {
+  return new Promise(r => setTimeout(r, ms));
+}
 
-  for (const s of statDefs) {
+function fetchBuffer(url, attempt = 1) {
+  return new Promise((resolve, reject) => {
     try {
-      const makeBody = (vuosi) => ({
-        query: [
-          { code: 'Alue',   selection: { filter: 'item', values: ['KU272'] } },
-          { code: 'Tiedot', selection: { filter: 'item', values: [s.tiedot] } },
-          { code: 'Vuosi',  selection: { filter: 'item', values: [vuosi] } }
-        ],
-        response: { format: 'json' }
+      const mod = url.startsWith('https') ? https : http;
+      const req = mod.get(url, async (res) => {
+        try {
+          resolve(await collectResponse(res));
+        } catch (err) { reject(err); }
       });
+      req.setTimeout(CONFIG.HTTP_TIMEOUT_MS);
+      req.on('error', async (err) => {
+        if (attempt < CONFIG.REQUEST_RETRY_ATTEMPTS) {
+          Logger.warn(`Retry attempt ${attempt} for ${url}`);
+          await sleep(CONFIG.REQUEST_RETRY_DELAY_MS);
+          resolve(fetchBuffer(url, attempt + 1));
+        } else {
+          reject(err);
+        }
+      });
+    } catch (err) { reject(err); }
+  });
+}
 
-      const [v2024, v2023] = await Promise.all([
-        fetchStat(STAT_VAESTO_URL, makeBody('2024')),
-        fetchStat(STAT_VAESTO_URL, makeBody('2023'))
-      ]);
+// ============================================================================
+// RSS PARSING
+// ============================================================================
 
-      document.getElementById(s.elValue).textContent = s.format(v2024);
+function parseRSS(buffer) {
+  // Dynasty käyttää aina iso-8859-1 — kovakoodataan latin1
+  const text = buffer.toString('latin1');
+  const items = [];
+  const itemRegex = /<item>([\s\S]*?)<\/item>/g;
+  let match;
 
-      const diff = v2024 - v2023;
-      const sign = diff >= 0 ? '+' : '';
-      const changeEl = document.getElementById(s.elChange);
-      changeEl.textContent = sign + (s.unit === '%'
-        ? diff.toFixed(1) + '% (2024 vs 2023)'
-        : Math.round(diff).toLocaleString('fi-FI') + ' hlö (2024 vs 2023)');
-      changeEl.className = 'stat-change ' + (diff > 0 ? 'up' : diff < 0 ? 'down' : 'neutral');
-    } catch (e) {
-      document.getElementById(s.elValue).textContent = '–';
-      document.getElementById(s.elChange).textContent = 'virhe';
+  while ((match = itemRegex.exec(text)) !== null) {
+    try {
+      const item = match[1];
+      const get = (tag) => {
+        const regex = new RegExp(
+          `<${tag}[^>]*><!\\[CDATA\\[([\\s\\S]*?)\\]\\]><\\/${tag}>|<${tag}[^>]*>([^<]*)<\\/${tag}>`,
+          'i'
+        );
+        const m = item.match(regex);
+        return m ? (m[1] || m[2] || '').trim() : '';
+      };
+      items.push({
+        otsikko:     get('title'),
+        kuvaus:      get('description'),
+        linkki:      get('link'),
+        julkaistu:   get('pubDate'),
+        ulkoinen_id: get('guid') || get('link')
+      });
+    } catch (err) {
+      Logger.warn('Error parsing RSS item', err);
     }
   }
+  return items;
+}
 
-  // Työttömyysaste
+// ============================================================================
+// SUPABASE API
+// ============================================================================
+
+function supabaseRequest(path, method = 'GET', body = null) {
+  return new Promise((resolve, reject) => {
+    try {
+      const bodyStr = body ? JSON.stringify(body) : '';
+      const url = new URL(SUPABASE_URL + '/rest/v1/' + path);
+      const options = {
+        hostname: url.hostname,
+        path: url.pathname + url.search,
+        method,
+        headers: {
+          'Content-Type': 'application/json',
+          'apikey': SUPABASE_SERVICE_KEY,
+          'Authorization': `Bearer ${SUPABASE_SERVICE_KEY}`,
+          'Prefer': 'resolution=merge-duplicates'
+        },
+        timeout: CONFIG.HTTP_TIMEOUT_MS
+      };
+      if (bodyStr) options.headers['Content-Length'] = Buffer.byteLength(bodyStr);
+
+      const req = https.request(options, async (res) => {
+        try {
+          const buffer = await collectResponse(res);
+          const text = buffer.toString();
+          if (res.statusCode >= 400) throw new Error(`Supabase error ${res.statusCode}: ${text}`);
+          resolve(text);
+        } catch (err) { reject(err); }
+      });
+      req.on('error', reject);
+      req.on('timeout', () => { req.destroy(); reject(new Error('Supabase request timeout')); });
+      if (bodyStr) req.write(bodyStr);
+      req.end();
+    } catch (err) { reject(err); }
+  });
+}
+
+function supabaseGet(path) {
+  return new Promise(async (resolve, reject) => {
+    try {
+      const response = await supabaseRequest(path, 'GET');
+      try { resolve(JSON.parse(response)); }
+      catch (err) { Logger.warn('Failed to parse Supabase response', err); resolve([]); }
+    } catch (err) { Logger.error('supabaseGet error', err); reject(err); }
+  });
+}
+
+async function supabaseBatchRequest(path, method, items) {
+  const results = [];
+  for (let i = 0; i < items.length; i += CONFIG.PARALLEL_REQUESTS) {
+    const batch = items.slice(i, i + CONFIG.PARALLEL_REQUESTS);
+    const promises = batch.map(item => supabaseRequest(path, method, item));
+    try {
+      const batchResults = await Promise.allSettled(promises);
+      results.push(...batchResults);
+    } catch (err) { Logger.error('Batch request error', err); }
+    if (i + CONFIG.PARALLEL_REQUESTS < items.length) await sleep(100);
+  }
+  return results;
+}
+
+// ============================================================================
+// SUPABASE SAVE OPERATIONS
+// ============================================================================
+
+async function saveToSupabase(items, tyyppi) {
+  if (!SUPABASE_URL || !SUPABASE_SERVICE_KEY) {
+    Logger.warn('Supabase not configured, skipping save');
+    return;
+  }
+
+  const processedItems = items.map(item => {
+    let julkaisija = 'Kokkola';
+    let otsikko = item.otsikko;
+    if (otsikko.includes(' / ')) {
+      const parts = otsikko.split(' / ');
+      julkaisija = parts[0].trim();
+      otsikko = parts.slice(1).join(' / ').trim();
+    }
+    let julkaistu = null;
+    if (item.julkaistu) {
+      const d = new Date(item.julkaistu);
+      if (!isNaN(d.getTime())) julkaistu = d.toISOString().split('T')[0];
+    }
+    return { ulkoinen_id: item.ulkoinen_id, otsikko, kuvaus: item.kuvaus, julkaisija, linkki: item.linkki, julkaistu, tyyppi };
+  });
+
   try {
-    const metaRes = await fetch(STAT_TYO_URL);
-    const meta    = await metaRes.json();
-    const kuukaudet   = meta.variables.find(v => v.code === 'Kuukausi').values;
-    const uusinKk     = kuukaudet[kuukaudet.length - 1];
-    const edellinenKk = kuukaudet[kuukaudet.length - 13];
+    await supabaseBatchRequest('paatokset?on_conflict=ulkoinen_id', 'POST', processedItems);
+    Logger.info(`Saved ${processedItems.length} items to Supabase`, { tyyppi });
+  } catch (err) { Logger.error('Error saving to Supabase', err); }
+}
 
-    const tyoBody = {
-      query: [
-        { code: 'Alue',     selection: { filter: 'item', values: ['KU272'] } },
-        { code: 'Kuukausi', selection: { filter: 'item', values: [uusinKk, edellinenKk] } },
-        { code: 'Tiedot',   selection: { filter: 'item', values: ['TYOTOSUUS'] } }
-      ],
-      response: { format: 'json' }
-    };
+// ============================================================================
+// ANTHROPIC API (Claude)
+// ============================================================================
 
-    const tyoRes  = await fetch(STAT_TYO_URL, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(tyoBody) });
-    const tyoData = await tyoRes.json();
+function callClaude(messages, systemPrompt, tools = null) {
+  return new Promise((resolve, reject) => {
+    try {
+      const payload = {
+        model: CONFIG.CLAUDE_MODEL,
+        max_tokens: CONFIG.CLAUDE_MAX_TOKENS,
+        system: systemPrompt,
+        messages
+      };
+      if (tools) payload.tools = tools;
 
-    const uusinArvo     = parseFloat(tyoData.data[0]?.values[0]);
-    const edellinenArvo = parseFloat(tyoData.data[1]?.values[0]);
+      const body = JSON.stringify(payload);
+      const options = {
+        hostname: 'api.anthropic.com',
+        path: '/v1/messages',
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'x-api-key': ANTHROPIC_KEY,
+          'anthropic-version': '2023-06-01',
+          'anthropic-beta': 'web-search-2025-03-05',
+          'Content-Length': Buffer.byteLength(body)
+        },
+        timeout: CONFIG.HTTP_TIMEOUT_MS
+      };
 
-    if (!isNaN(uusinArvo)) {
-      document.getElementById('stat-tyottomyys').textContent = uusinArvo.toFixed(1) + '%';
-      const kkLabel = uusinKk.replace('M', '/');
-      if (!isNaN(edellinenArvo)) {
-        const diff = uusinArvo - edellinenArvo;
-        const sign = diff >= 0 ? '+' : '';
-        const changeEl = document.getElementById('stat-tyottomyys-change');
-        changeEl.textContent = sign + diff.toFixed(1) + '% vs vuosi sitten (' + kkLabel + ')';
-        changeEl.className = 'stat-change ' + (diff > 0 ? 'up' : diff < 0 ? 'down' : 'neutral');
+      const req = https.request(options, async (res) => {
+        try {
+          const buffer = await collectResponse(res);
+          if (res.statusCode >= 400) throw new Error(`Claude API error ${res.statusCode}: ${buffer.toString()}`);
+          try { resolve(JSON.parse(buffer.toString())); }
+          catch (parseErr) { reject(new Error(`Failed to parse Claude response: ${parseErr.message}`)); }
+        } catch (err) { reject(err); }
+      });
+      req.on('error', reject);
+      req.on('timeout', () => { req.destroy(); reject(new Error('Claude request timeout')); });
+      req.write(body);
+      req.end();
+    } catch (err) { reject(err); }
+  });
+}
+
+// ============================================================================
+// NEWS FETCHING
+// ============================================================================
+
+async function fetchNews(aihe, query) {
+  if (!ANTHROPIC_KEY) { Logger.warn('ANTHROPIC_KEY not set, skipping news fetch'); return; }
+  Logger.info('Fetching news', { aihe, query });
+
+  try {
+    const tools = [{ type: 'web_search_20250305', name: 'web_search' }];
+
+    const result = await callClaude(
+      [{
+        role: 'user',
+        content: `Search for the latest news about: ${query}. Search multiple times to find news from different sources like news sites, press releases, LinkedIn, and official announcements. After using web_search tool (use it 2-3 times with different queries), you MUST respond with ONLY a raw JSON array with no markdown formatting and no other text. Each item must have: otsikko (string), url (string), kuvaus (string), julkaistu (date string YYYY-MM-DD or empty).`
+      }],
+      'You are a news search assistant. Search broadly for news from many different sources. After using web_search tool (use it 2-3 times with different queries), you MUST respond with ONLY a raw JSON array with no markdown, code blocks, or other text.',
+      tools
+    );
+
+    const textBlocks = (result.content || []).filter(b => b.type === 'text');
+    const text = textBlocks.map(b => b.text).join('');
+    const clean = text.replace(/```json|```/g, '').trim();
+    Logger.debug('Claude response', { aihe, preview: clean.slice(0, 300) });
+
+    let news;
+    try {
+      news = JSON.parse(clean);
+    } catch (err) {
+      const match = clean.match(/\[\s*\{[\s\S]*\}\s*\]/);
+      if (match) {
+        try { news = JSON.parse(match[0]); }
+        catch (parseErr) { Logger.error('JSON parse error for news', { aihe, error: parseErr.message }); return; }
       } else {
-        document.getElementById('stat-tyottomyys-change').textContent = kkLabel;
+        Logger.error('No JSON array found in response', { aihe, preview: clean.slice(0, 300) });
+        return;
       }
     }
-  } catch (e) {
-    document.getElementById('stat-tyottomyys').textContent = '–';
-    document.getElementById('stat-tyottomyys-change').textContent = 'ei dataa';
-  }
+
+    if (!Array.isArray(news)) { Logger.error('Invalid news format - not an array', { aihe }); return; }
+
+    const saveAihe = aihe === 'arctial2' ? 'arctial' : aihe;
+    if (aihe !== 'arctial2') {
+      try { await supabaseRequest(`uutiset?aihe=eq.${encodeURIComponent(saveAihe)}`, 'DELETE', {}); }
+      catch (err) { Logger.warn('Failed to delete old news', { aihe, error: err.message }); }
+    }
+
+    const newsToSave = news
+      .filter(item => item.otsikko && item.url)
+      .map(item => ({ aihe: saveAihe, otsikko: item.otsikko, url: item.url, kuvaus: item.kuvaus || '', julkaistu: item.julkaistu || '' }));
+
+    await supabaseBatchRequest('uutiset', 'POST', newsToSave);
+    Logger.info('Saved news items', { aihe: saveAihe, count: newsToSave.length });
+  } catch (err) { Logger.error('fetchNews error', err); }
 }
 
-// ============================================================
-// DECISIONS
-// ============================================================
+// ============================================================================
+// PDF PARSING
+// ============================================================================
 
-async function loadDecisions() {
-  const list = document.getElementById('decisions-list');
-  list.innerHTML = '<div style="padding:32px 24px;text-align:center;color:var(--text3);font-size:0.8rem;">⏳ Ladataan päätöksiä Kokkolasta...</div>';
+async function parsePdfWithClaude(pdfUrl, kokousId, kokousPvm) {
+  if (!ANTHROPIC_KEY) { Logger.warn('ANTHROPIC_KEY not set, skipping PDF parse'); return; }
+  Logger.info('Parsing PDF', { pdfUrl, kokousId });
 
   try {
-    const res    = await fetch(PROXY_DECISIONS);
-    const buffer = await res.arrayBuffer();
-    let text     = new TextDecoder('windows-1252').decode(buffer);
-    text         = text.replace(/encoding="[^"]+"/i, 'encoding="utf-8"');
-    const xml    = new DOMParser().parseFromString(text, 'application/xml');
-    const items  = xml.querySelectorAll('item');
-
-    if (!items.length) {
-      list.innerHTML = '<div style="padding:32px 24px;text-align:center;color:var(--text3);font-size:0.8rem;">⚠️ Ei päätöksiä saatavilla</div>';
+    const pdfBuffer = await fetchBuffer(pdfUrl);
+    if (pdfBuffer.length < CONFIG.PDF_MIN_SIZE) {
+      Logger.warn('PDF too small', { kokousId, size: pdfBuffer.length });
       return;
     }
 
-    list.innerHTML = '';
-    items.forEach(item => {
-      const title   = item.querySelector('title')?.textContent || '–';
-      const desc    = item.querySelector('description')?.textContent || '';
-      const link    = item.querySelector('link')?.textContent || '#';
-      const pubDate = item.querySelector('pubDate')?.textContent || '';
+    const result = await callClaude(
+      [{
+        role: 'user',
+        content: [
+          { type: 'document', source: { type: 'base64', media_type: 'application/pdf', data: pdfBuffer.toString('base64') } },
+          { type: 'text', text: 'Lue tämä Kokkolan kaupungin kokousasiakirja ja poimii kaikki taloudelliset ja henkilöstötiedot. Palauta VAIN JSON-objekti ilman mitään muuta tekstiä tai markdownia. JSON:ssa: tyyppi (string: "budjetti", "palkka", "sopimus", "investointi", tai "ei_relevantti"), summat (array), osastot (array), henkilöt (array), yhteenveto (string).' }
+        ]
+      }],
+      'Olet Kokkolan kaupungin taloushallinnon asiantuntija. Poimit dataa dokumenteista tarkasti JSON-muodossa.'
+    );
 
-      let dateStr = '';
-      if (pubDate) { const d = new Date(pubDate); if (!isNaN(d)) dateStr = d.toLocaleDateString('fi-FI'); }
+    const text = (result.content || []).filter(b => b.type === 'text').map(b => b.text).join('');
+    const clean = text.replace(/```json|```/g, '').trim();
+    const data = JSON.parse(clean);
 
-      let issuer = 'Kokkola', decisionTitle = title;
-      if (title.includes(' / ')) {
-        const parts = title.split(' / ');
-        issuer = parts[0].trim();
-        decisionTitle = parts.slice(1).join(' / ').trim();
-      }
-
-      const el = document.createElement('div');
-      el.className     = 'decision-item';
-      el.dataset.status = 'passed';
-      el.dataset.text  = (title + ' ' + desc).toLowerCase();
-      if (pubDate) { const pd = new Date(pubDate); if (!isNaN(pd)) el.dataset.date = pd.toISOString(); }
-      el.innerHTML = `
-        <div class="decision-dot" style="background:var(--green)"></div>
-        <div class="decision-content">
-          <div class="decision-title">${decisionTitle}</div>
-          <div class="decision-meta">
-            <span>${issuer}</span>
-            ${dateStr ? `<span>${dateStr}</span>` : ''}
-          </div>
-        </div>
-        <div class="decision-status status-passed">Päätös</div>
-      `;
-      el.addEventListener('click', () => openModal(decisionTitle, desc || 'Ei kuvausta saatavilla.', issuer + (dateStr ? ' · ' + dateStr : ''), link));
-      list.appendChild(el);
-    });
-
-    document.getElementById('decisions-count').textContent = items.length + ' kpl';
-    applyFilters();
-  } catch (e) {
-    list.innerHTML = '<div style="padding:32px 24px;text-align:center;color:var(--red);font-size:0.8rem;">⚠️ Virhe ladattaessa päätöksiä.</div>';
-  }
-}
-
-// ============================================================
-// MEETINGS (kokousasiat)
-// ============================================================
-
-async function loadMeetings() {
-  try {
-    const res    = await fetch(PROXY_MEETINGS);
-    const buffer = await res.arrayBuffer();
-    let text     = new TextDecoder('windows-1252').decode(buffer);
-    text         = text.replace(/encoding="[^"]+"/i, 'encoding="utf-8"');
-    const xml    = new DOMParser().parseFromString(text, 'application/xml');
-    const items  = xml.querySelectorAll('item');
-
-    if (!items.length) return;
-
-    document.getElementById('stat-paatokset').textContent = items.length;
-
-    const list = document.getElementById('decisions-list');
-    items.forEach(item => {
-      const getTag = tag => {
-        const el = item.querySelector(tag);
-        return el ? (el.textContent || el.innerHTML || '').replace(/<!\[CDATA\[|\]\]>/g, '').trim() : '';
-      };
-      const title   = getTag('title') || '–';
-      const desc    = getTag('description') || '';
-      const link    = getTag('link') || '#';
-      const pubDate = getTag('pubDate') || '';
-
-      let dateStr = '';
-      if (pubDate) { const d = new Date(pubDate); if (!isNaN(d)) dateStr = d.toLocaleDateString('fi-FI'); }
-
-      let issuer = 'Kokkola', meetingTitle = title;
-      if (title.includes(' / ')) {
-        const parts = title.split(' / ');
-        issuer = parts[0].trim();
-        meetingTitle = parts.slice(1).join(' / ').trim();
-      }
-
-      const el = document.createElement('div');
-      el.className      = 'decision-item';
-      el.dataset.status = 'meeting';
-      el.dataset.text   = (title + ' ' + desc).toLowerCase();
-      const dmatch = title.match(/(\d{1,2})\.(\d{1,2})\.(\d{4})/);
-      if (dmatch) {
-        const md = new Date(parseInt(dmatch[3]), parseInt(dmatch[2]) - 1, parseInt(dmatch[1]));
-        if (!isNaN(md.getTime())) el.dataset.date = md.toISOString();
-      }
-      el.innerHTML =
-        '<div class="decision-dot" style="background:var(--cyan)"></div>' +
-        '<div class="decision-content">' +
-          '<div class="decision-title">' + meetingTitle + '</div>' +
-          '<div class="decision-meta"><span>' + issuer + '</span>' + (dateStr ? '<span>' + dateStr + '</span>' : '') + '</div>' +
-        '</div>' +
-        '<div class="decision-status status-review">Kokous</div>';
-      el.addEventListener('click', () => openModal(meetingTitle, desc || 'Ei kuvausta.', issuer + (dateStr ? ' – ' + dateStr : ''), link));
-      list.appendChild(el);
-    });
-
-    // Update badge
-    const badge = document.getElementById('decisions-count');
-    const current = parseInt(badge.textContent) || 0;
-    badge.textContent = (current + items.length) + ' kpl';
-    applyFilters();
-  } catch (e) {
-    console.error('Virhe ladattaessa kokousasioita:', e);
-  }
-}
-
-// ============================================================
-// AGENDAS (kokoukset)
-// ============================================================
-
-function setMeetingFilter(filter, btn) {
-  meetingFilter = filter;
-  document.querySelectorAll('[data-mfilter]').forEach(b => b.classList.remove('active'));
-  btn.classList.add('active');
-  renderAgendasTop();
-}
-
-function renderAgendasTop() {
-  const list = document.getElementById('upcoming-meetings-list-top');
-  if (!list) return;
-  const now       = new Date();
-  const searchVal = (document.getElementById('meeting-search')?.value || '').toLowerCase().trim();
-
-  let filtered = allAgendaItems.filter(item => {
-    const d    = item.date ? new Date(item.date) : null;
-    const year = d ? d.getFullYear() : null;
-    if (meetingFilter === 'tulevat') { if (!(!d || d >= now)) return false; }
-    else if (meetingFilter === 'menneet') { if (!(d && d < now && year >= 2026)) return false; }
-    else if (meetingFilter === 'kh') { if (!item.title.toLowerCase().includes('kaupunginhallitus')) return false; }
-    if (searchVal && !item.title.toLowerCase().includes(searchVal)) return false;
-    return true;
-  });
-
-  filtered.sort((a, b) =>
-    meetingFilter === 'tulevat'
-      ? (a.date || '') < (b.date || '') ? -1 : 1
-      : (a.date || '') > (b.date || '') ? -1 : 1
-  );
-  filtered = filtered.slice(0, 8);
-
-  if (!filtered.length) {
-    list.innerHTML = '<div style="padding:16px;color:var(--text3);font-size:0.78rem;">Ei kokouksia</div>';
-    return;
-  }
-  list.innerHTML = filtered.map(item =>
-    '<a href="' + item.link + '" target="_blank" class="upcoming-item">' +
-      (item.dateStr ? '<div class="upcoming-date">' + item.dateStr + '</div>' : '') +
-      '<div class="upcoming-title">' + item.title + '</div>' +
-      '<div class="upcoming-body">Avaa esityslista →</div>' +
-    '</a>'
-  ).join('');
-}
-
-async function loadAgendas() {
-  const list = document.getElementById('upcoming-meetings-list-top');
-  if (!list) return;
-
-  try {
-    const res    = await fetch(PROXY_AGENDAS);
-    const buffer = await res.arrayBuffer();
-    let text     = new TextDecoder('windows-1252').decode(buffer);
-    text         = text.replace(/encoding="[^"]+"/i, 'encoding="utf-8"');
-    const xml    = new DOMParser().parseFromString(text, 'application/xml');
-    const items  = Array.from(xml.querySelectorAll('item'));
-
-    allAgendaItems = items.map(item => {
-      const fullTitle = item.querySelector('title')?.textContent || '–';
-      const linkUrl   = item.querySelector('link')?.textContent || '#';
-      const dateMatch = fullTitle.match(/(\d{1,2})\.(\d{1,2})\.(\d{4})/);
-      let dateStr = '', date = null, title = fullTitle;
-      if (dateMatch) {
-        const [, day, mon, year] = dateMatch;
-        const d = new Date(year, mon - 1, day);
-        if (!isNaN(d.getTime())) {
-          date    = d.toISOString();
-          dateStr = d.toLocaleDateString('fi-FI', { weekday: 'short', day: 'numeric', month: 'numeric', year: 'numeric' });
-        }
-        title = fullTitle.replace(dateMatch[0], '').trim();
-      }
-      return { title, link: linkUrl, date, dateStr };
-    });
-
-    const now = new Date();
-    allAgendaItems.sort((a, b) => {
-      const da = a.date ? new Date(a.date) : now;
-      const db = b.date ? new Date(b.date) : now;
-      if (da >= now && db >= now) return da - db;
-      if (da <  now && db <  now) return db - da;
-      return 0;
-    });
-
-    renderAgendasTop();
-    loadNews();
-  } catch (e) {
-    list.innerHTML = '<div style="padding:16px;color:var(--text3);font-size:0.78rem;">Virhe ladattaessa kokouksia</div>';
-  }
-}
-
-// ============================================================
-// FILTERS & SEARCH
-// ============================================================
-
-function setFilter(filter, btn) {
-  activeFilter = filter;
-  showAll      = false;
-  document.querySelectorAll('[data-dfilter]').forEach(b => b.classList.remove('active'));
-  btn.classList.add('active');
-  applyFilters();
-}
-
-function handleSearch(value) {
-  activeQuery = value.trim().toLowerCase();
-  document.getElementById('searchClear').style.display = activeQuery ? 'block' : 'none';
-  applyFilters();
-}
-
-function clearSearch() {
-  document.getElementById('searchInput').value = '';
-  activeQuery = '';
-  document.getElementById('searchClear').style.display = 'none';
-  applyFilters();
-  document.getElementById('searchInput').focus();
-}
-
-function applyFilters() {
-  const now   = new Date();
-  const items = document.querySelectorAll('#decisions-list .decision-item');
-  let visible = 0;
-
-  items.forEach(item => {
-    const status   = item.dataset.status;
-    const text     = (item.dataset.text + ' ' + item.innerText).toLowerCase();
-    const itemDate = item.dataset.date ? new Date(item.dataset.date) : null;
-
-    let matchFilter = false;
-    if (activeFilter === 'all') {
-      matchFilter = true;
-    } else if (activeFilter === 'viranomais') {
-      matchFilter = status === 'passed';
-    } else if (activeFilter === 'paatokset') {
-      matchFilter = status === 'passed' || (status === 'meeting' && itemDate && itemDate < now);
-    } else if (activeFilter === 'esitykset') {
-      matchFilter = status === 'meeting' && (!itemDate || itemDate >= now);
+    if (data.tyyppi && data.tyyppi !== 'ei_relevantti') {
+      await supabaseRequest('talousdata?on_conflict=kokous_id', 'POST',
+        { kokous_id: kokousId, kokous_pvm: kokousPvm, raportti_tyyppi: data.tyyppi, data: JSON.stringify(data) });
+      Logger.info('Saved financial data', { kokousId, type: data.tyyppi });
     } else {
-      matchFilter = status === activeFilter;
+      Logger.info('PDF not relevant', { kokousId });
     }
+  } catch (err) { Logger.error('PDF parse error', { kokousId, error: err.message }); }
+}
 
-    const matchQuery = !activeQuery || text.includes(activeQuery);
-    const show = matchFilter && matchQuery;
-    item.style.display = show ? '' : 'none';
+// ============================================================================
+// MEETING PARSING
+// ============================================================================
 
-    if (show) {
-      // Highlight search term
-      const titleEl = item.querySelector('.decision-title');
-      if (activeQuery && titleEl) {
-        const orig = titleEl.textContent;
-        const idx  = orig.toLowerCase().indexOf(activeQuery);
-        if (idx >= 0) {
-          titleEl.innerHTML =
-            orig.slice(0, idx) +
-            '<span class="search-highlight">' + orig.slice(idx, idx + activeQuery.length) + '</span>' +
-            orig.slice(idx + activeQuery.length);
+async function getMeetingItemIds(meetingId) {
+  try {
+    const buffer = await fetchBuffer(`https://kokkola10.oncloudos.com/cgi/DREQUEST.PHP?page=meeting&id=${encodeURIComponent(meetingId)}`);
+    const html = buffer.toString('latin1');
+    const regex = /page=meetingitem&amp;id=(\d+-\d+)/g;
+    const ids = new Set();
+    let match;
+    while ((match = regex.exec(html)) !== null) ids.add(match[1]);
+    return Array.from(ids);
+  } catch (err) {
+    Logger.error('getMeetingItemIds error', { meetingId, error: err.message });
+    return [];
+  }
+}
+
+// ============================================================================
+// KAUPUNGINHALLITUS PDF CHECKING
+// ============================================================================
+
+async function checkKaupunginhallitusPdfs() {
+  if (!ANTHROPIC_KEY) { Logger.warn('ANTHROPIC_KEY not set, skipping PDF check'); return; }
+  Logger.info('Checking kaupunginhallitus PDFs');
+
+  try {
+    const buffer = await fetchBuffer(FEEDS['/agendas']);
+    const items = parseRSS(buffer);
+    const khMeetings = items.filter(item => item.otsikko.toLowerCase().includes('kaupunginhallitus'));
+    Logger.info('Found KH meetings', { count: khMeetings.length });
+
+    for (const meeting of khMeetings.slice(0, 2)) {
+      try {
+        const idMatch = meeting.linkki.match(/id=(\d+)/);
+        if (!idMatch) continue;
+        const meetingId = idMatch[1];
+        const dateMatch = meeting.otsikko.match(/(\d{1,2})\.(\d{1,2})\.(\d{4})/);
+        const kokousPvm = dateMatch
+          ? `${dateMatch[3]}-${dateMatch[2].padStart(2, '0')}-${dateMatch[1].padStart(2, '0')}`
+          : null;
+
+        Logger.info('Processing meeting', { meetingId, kokousPvm });
+        const itemIds = await getMeetingItemIds(meetingId);
+
+        for (const itemId of itemIds) {
+          try {
+            const existing = await supabaseGet(`talousdata?kokous_id=eq.${encodeURIComponent(itemId)}&select=id`);
+            if (existing.length > 0) { Logger.debug('Item already processed', { itemId }); continue; }
+            await parsePdfWithClaude(`https://kokkola10.oncloudos.com/kokous/${encodeURIComponent(itemId)}.PDF`, itemId, kokousPvm);
+            await sleep(CONFIG.PDF_REQUEST_DELAY_MS);
+          } catch (err) { Logger.error('Error processing item', { itemId, error: err.message }); }
         }
-      }
-      visible++;
+      } catch (err) { Logger.error('Error processing meeting', { error: err.message }); }
     }
-  });
+  } catch (err) { Logger.error('checkKaupunginhallitusPdfs error', err); }
+}
 
-  // Limit to 15 unless showAll or search active
-  if (!showAll && !activeQuery) {
-    let shown = 0;
-    items.forEach(item => {
-      if (item.style.display !== 'none') {
-        shown++;
-        if (shown > 15) item.style.display = 'none';
+// ============================================================================
+// SYNC OPERATIONS
+// ============================================================================
+
+async function syncFeeds() {
+  Logger.info('Starting feed sync');
+  try {
+    for (const [path, url] of Object.entries(FEEDS)) {
+      if (path === '/agendas') continue;
+      try {
+        const tyyppi = path === '/decisions' ? 'paatos' : 'kokous';
+        const buffer = await fetchBuffer(url);
+        const items = parseRSS(buffer);
+        await saveToSupabase(items, tyyppi);
+        Logger.info('Synced feed', { path, count: items.length });
+      } catch (err) { Logger.error('Error syncing feed', { path, error: err.message }); }
+    }
+    await checkKaupunginhallitusPdfs();
+  } catch (err) { Logger.error('syncFeeds error', err); }
+}
+
+async function syncNews() {
+  Logger.info('Starting news sync');
+  try {
+    await fetchNews('arctial', 'Arctial alumiinitehdas Kokkola 2026');
+    await sleep(2000);
+    await fetchNews('arctial2', 'Arctial Kokkola site:yle.fi OR site:keskipohjanmaa.fi OR site:kauppalehti.fi OR site:talouselama.fi');
+    await sleep(3000);
+    await fetchNews('kokkola', '"Kokkola" uutiset 2026 site:yle.fi OR site:keskipohjanmaa.fi OR site:kokkola.fi OR site:ampparit.com/kokkola');
+    Logger.info('News sync completed');
+  } catch (err) { Logger.error('syncNews error', err); }
+}
+
+// ============================================================================
+// HTTP SERVER
+// ============================================================================
+
+function checkCorsOrigin(req) {
+  if (ALLOWED_ORIGINS.includes('*')) return true;
+  return ALLOWED_ORIGINS.includes(req.headers.origin || '');
+}
+
+function sendError(res, statusCode, message) {
+  res.statusCode = statusCode;
+  res.setHeader('Content-Type', 'application/json');
+  res.end(JSON.stringify({ error: message }));
+}
+
+const server = http.createServer(async (req, res) => {
+  res.setHeader('Content-Type', 'application/json');
+  if (checkCorsOrigin(req)) res.setHeader('Access-Control-Allow-Origin', req.headers.origin || '*');
+  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+
+  if (req.method === 'OPTIONS') { res.statusCode = 200; res.end(); return; }
+
+  try {
+    if (req.url === '/health') {
+      res.statusCode = 200;
+      res.end(JSON.stringify({ status: 'ok', uptime: process.uptime(), timestamp: new Date().toISOString() }));
+      return;
+    }
+
+    if (req.url === '/sync') {
+      res.statusCode = 202;
+      res.end(JSON.stringify({ message: 'Feed sync started' }));
+      syncFeeds().catch(err => Logger.error('Async syncFeeds error', err));
+      return;
+    }
+
+    if (req.url === '/parse-pdfs') {
+      res.statusCode = 202;
+      res.end(JSON.stringify({ message: 'PDF parsing started' }));
+      checkKaupunginhallitusPdfs().catch(err => Logger.error('Async PDF parse error', err));
+      return;
+    }
+
+    if (req.url === '/sync-news') {
+      res.statusCode = 202;
+      res.end(JSON.stringify({ message: 'News sync started' }));
+      syncNews().catch(err => Logger.error('Async news sync error', err));
+      return;
+    }
+
+    if (req.url.match(/^\/news\/(arctial|kokkola)$/)) {
+      const aihe = req.url.split('/')[2];
+      try {
+        const data = await supabaseGet(`uutiset?aihe=eq.${encodeURIComponent(aihe)}&order=id.desc&limit=10`);
+        res.statusCode = 200;
+        res.end(JSON.stringify(data));
+      } catch (err) {
+        Logger.error('News fetch error', { aihe, error: err.message });
+        sendError(res, 500, 'Failed to fetch news');
       }
+      return;
+    }
+
+    // Feed proxy
+    const feedUrl = FEEDS[req.url] || FEEDS['/decisions'];
+    https.get(feedUrl, rssRes => {
+      res.setHeader('Content-Type', 'application/xml; charset=iso-8859-1');
+      rssRes.pipe(res);
+    }).on('error', err => {
+      Logger.error('Feed proxy error', { url: req.url, error: err.message });
+      sendError(res, 500, 'Failed to fetch feed');
     });
-    visible = Math.min(visible, 15);
+  } catch (err) {
+    Logger.error('Request handler error', err);
+    sendError(res, 500, 'Internal server error');
   }
-
-  document.getElementById('decisions-empty').style.display = visible === 0 ? 'block' : 'none';
-  const showMoreBtn = document.getElementById('show-more-btn');
-  if (showMoreBtn) showMoreBtn.style.display = (!showAll && !activeQuery && visible >= 15) ? 'block' : 'none';
-}
-
-// ============================================================
-// NEWS
-// ============================================================
-
-function filterNews(aihe) {
-  const query = (document.getElementById('search-' + aihe)?.value || '').toLowerCase().trim();
-  const el    = document.getElementById('news-' + aihe);
-  if (!el || !newsCache[aihe]) return;
-  const filtered = query
-    ? newsCache[aihe].filter(item => (item.otsikko + ' ' + (item.kuvaus || '')).toLowerCase().includes(query))
-    : newsCache[aihe];
-  renderNewsItems(el, filtered);
-}
-
-function renderNewsItems(el, items) {
-  if (!items || !items.length) {
-    el.innerHTML = '<div style="padding:16px;color:var(--text3);font-size:0.78rem;">Ei hakutuloksia</div>';
-    return;
-  }
-  el.innerHTML = items.map(item =>
-    '<a href="' + (item.url || '#') + '" target="_blank" class="news-item">' +
-      '<div class="news-title">' + item.otsikko + '</div>' +
-      (item.julkaistu ? '<div class="news-meta">' + item.julkaistu + '</div>' : '') +
-      (item.kuvaus    ? '<div class="news-desc">'  + item.kuvaus    + '</div>' : '') +
-    '</a>'
-  ).join('');
-}
-
-async function loadNews() {
-  for (const aihe of ['arctial', 'kokkola']) {
-    const el = document.getElementById('news-' + aihe);
-    if (!el) continue;
-    try {
-      const res  = await fetch(PROXY_BASE + '/news/' + aihe);
-      let items  = await res.json();
-
-      // Sort newest first
-      items.sort((a, b) => {
-        const parse = s => {
-          if (!s) return 0;
-          const m = s.match(/(\d{1,2})\.(\d{1,2})\.(\d{4})/);
-          if (m) return new Date(m[3], m[2] - 1, m[1]).getTime();
-          return new Date(s).getTime() || 0;
-        };
-        return parse(b.julkaistu) - parse(a.julkaistu);
-      });
-
-      if (!items.length) {
-        el.innerHTML = '<div style="padding:16px;color:var(--text3);font-size:0.78rem;">Ei uutisia saatavilla</div>';
-        continue;
-      }
-      newsCache[aihe] = items;
-      renderNewsItems(el, items);
-    } catch (e) {
-      el.innerHTML = '<div style="padding:16px;color:var(--text3);font-size:0.78rem;">Virhe ladattaessa uutisia</div>';
-    }
-  }
-}
-
-// ============================================================
-// MODAL
-// ============================================================
-
-function openModal(title, body, tag, link) {
-  document.getElementById('modal-title').textContent = title;
-  document.getElementById('modal-body').textContent  = body;
-  document.getElementById('modal-tag').textContent   = tag;
-  const btn = document.querySelector('.modal-footer .btn-primary');
-  if (btn) btn.onclick = () => window.open(link, '_blank');
-  const overlay = document.getElementById('modal');
-  overlay.classList.add('open');
-  overlay.removeAttribute('aria-hidden');
-}
-
-function closeModal(e) {
-  if (e.target === document.getElementById('modal')) closeModalDirect();
-}
-
-function closeModalDirect() {
-  const overlay = document.getElementById('modal');
-  overlay.classList.remove('open');
-  overlay.setAttribute('aria-hidden', 'true');
-}
-
-// ============================================================
-// INIT
-// ============================================================
-
-document.addEventListener('DOMContentLoaded', () => {
-  // Date
-  const now = new Date();
-  const dateEl = document.getElementById('dash-date');
-  if (dateEl) {
-    dateEl.textContent = now.toLocaleDateString('fi-FI', { weekday: 'long', day: 'numeric', month: 'long', year: 'numeric' });
-  }
-
-  // Kaikki data-view napit (nav + hero CTA)
-  document.querySelectorAll('[data-view]').forEach(btn => {
-    btn.addEventListener('click', () => showView(btn.dataset.view));
-  });
-
-  // Filter buttons (data-dfilter = decisions filter)
-  document.querySelectorAll('[data-dfilter]').forEach(btn => {
-    btn.addEventListener('click', () => setFilter(btn.dataset.dfilter, btn));
-  });
-
-  // Meeting filter buttons (data-mfilter)
-  document.querySelectorAll('[data-mfilter]').forEach(btn => {
-    btn.addEventListener('click', () => setMeetingFilter(btn.dataset.mfilter, btn));
-  });
-
-  // Search input
-  const searchInput = document.getElementById('searchInput');
-  if (searchInput) {
-    searchInput.addEventListener('input', e => handleSearch(e.target.value));
-    searchInput.addEventListener('keydown', e => { if (e.key === 'Escape') clearSearch(); });
-  }
-  const searchClear = document.getElementById('searchClear');
-  if (searchClear) searchClear.addEventListener('click', clearSearch);
-
-  // Show more
-  const showMoreBtn = document.getElementById('show-more-btn');
-  if (showMoreBtn) showMoreBtn.addEventListener('click', () => { showAll = true; applyFilters(); });
-
-  // Modal close
-  document.getElementById('modal')?.addEventListener('click', closeModal);
-  document.getElementById('modal-close')?.addEventListener('click', closeModalDirect);
-
-  // Meeting search
-  document.getElementById('meeting-search')?.addEventListener('input', renderAgendasTop);
-
-  // News search
-  ['arctial', 'kokkola'].forEach(aihe => {
-    document.getElementById('search-' + aihe)?.addEventListener('input', () => filterNews(aihe));
-  });
 });
+
+// ============================================================================
+// SERVER STARTUP
+// ============================================================================
+
+async function startServer() {
+  try {
+    validateEnvironment();
+    Logger.info('Environment validation passed');
+
+    server.listen(PORT, () => {
+      Logger.info('Server started', { port: PORT });
+      syncFeeds().catch(err => Logger.error('Initial syncFeeds error', err));
+      syncNews().catch(err => Logger.error('Initial syncNews error', err));
+      setInterval(syncFeeds, CONFIG.FEED_SYNC_INTERVAL_MS);
+      setInterval(syncNews, CONFIG.NEWS_SYNC_INTERVAL_MS);
+    });
+
+    server.on('error', (err) => { Logger.error('Server error', err); process.exit(1); });
+  } catch (err) { Logger.error('Failed to start server', err); process.exit(1); }
+}
+
+process.on('uncaughtException', (err) => { Logger.error('Uncaught exception', err); process.exit(1); });
+process.on('unhandledRejection', (reason, promise) => { Logger.error('Unhandled rejection', { reason }); process.exit(1); });
+
+startServer();
+
+module.exports = { server, Logger };
