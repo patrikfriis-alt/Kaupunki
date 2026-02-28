@@ -356,8 +356,8 @@ async function parseMeetingItemText(itemId, kokousPvm) {
 
     const isFinancialReport = text.toLowerCase().includes('talous- ja henkilöstöraportti') ||
                               text.toLowerCase().includes('talousraportti');
+    Logger.info('Item text check', { itemId, isFinancialReport, preview: text.slice(0, 200).replace(/\s+/g, ' ') });
     if (!isFinancialReport) {
-      Logger.debug('Not a financial report, skipping', { itemId });
       return;
     }
 
@@ -461,10 +461,12 @@ async function checkKaupunginhallitusPdfs() {
         Logger.info('Processing meeting', { meetingId, kokousPvm });
         const itemIds = await getMeetingItemIds(meetingId);
 
+        let loggedFirst = false;
         for (const itemId of itemIds) {
           try {
             const existing = await supabaseGet(`talousdata?kokous_id=eq.${encodeURIComponent(itemId)}&select=id`);
             if (existing.length > 0) { Logger.debug('Item already processed', { itemId }); continue; }
+            if (!loggedFirst) { Logger.info('First item sample', { itemId }); loggedFirst = true; }
             await parseMeetingItemText(itemId, kokousPvm);
             await sleep(CONFIG.PDF_REQUEST_DELAY_MS);
           } catch (err) { Logger.error('Error processing item', { itemId, error: err.message }); }
