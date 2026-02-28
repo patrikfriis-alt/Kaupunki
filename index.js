@@ -331,43 +331,87 @@ async function fetchNews(aihe, query) {
 }
 
 // ============================================================================
-// PDF PARSING
+// MEETING ITEM TEXT PARSING
 // ============================================================================
 
-async function parsePdfWithClaude(pdfUrl, kokousId, kokousPvm) {
-  if (!ANTHROPIC_KEY) { Logger.warn('ANTHROPIC_KEY not set, skipping PDF parse'); return; }
-  Logger.info('Parsing PDF', { pdfUrl, kokousId });
+function extractTextFromHtml(html) {
+  return html
+    .replace(/<script[\s\S]*?<\/script>/gi, '')
+    .replace(/<style[\s\S]*?<\/style>/gi, '')
+    .replace(/<[^>]+>/g, ' ')
+    .replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&nbsp;/g, ' ')
+    .replace(/\s{2,}/g, ' ')
+    .trim();
+}
+
+async function parseMeetingItemText(itemId, kokousPvm) {
+  if (!ANTHROPIC_KEY) { Logger.warn('ANTHROPIC_KEY not set, skipping parse'); return; }
 
   try {
-    const pdfBuffer = await fetchBuffer(pdfUrl);
-    if (pdfBuffer.length < CONFIG.PDF_MIN_SIZE) {
-      Logger.warn('PDF too small', { kokousId, size: pdfBuffer.length });
+    const buffer = await fetchBuffer(
+      `https://kokkola10.oncloudos.com/cgi/DREQUEST.PHP?page=meetingitem&id=${encodeURIComponent(itemId)}`
+    );
+    const html = buffer.toString('latin1');
+    const text = extractTextFromHtml(html);
+
+    const isFinancialReport = text.toLowerCase().includes('talous- ja henkilöstöraportti') ||
+                              text.toLowerCase().includes('talousraportti');
+    if (!isFinancialReport) {
+      Logger.debug('Not a financial report, skipping', { itemId });
       return;
     }
+
+    Logger.info('Parsing financial report', { itemId, kokousPvm });
 
     const result = await callClaude(
       [{
         role: 'user',
-        content: [
-          { type: 'document', source: { type: 'base64', media_type: 'application/pdf', data: pdfBuffer.toString('base64') } },
-          { type: 'text', text: 'Lue tämä Kokkolan kaupungin kokousasiakirja ja poimii kaikki taloudelliset ja henkilöstötiedot. Palauta VAIN JSON-objekti ilman mitään muuta tekstiä tai markdownia. JSON:ssa: tyyppi (string: "budjetti", "palkka", "sopimus", "investointi", tai "ei_relevantti"), summat (array), osastot (array), henkilöt (array), yhteenveto (string).' }
-        ]
+        content: `Lue tämä Kokkolan kaupunginhallituksen talous- ja henkilöstöraportti ja poimi keskeiset talousluvut. Palauta VAIN JSON-objekti ilman mitään muuta tekstiä tai markdownia.
+
+JSON-rakenne:
+{
+  "tyyppi": "talousraportti",
+  "kuukausi": "esim. 11/2025",
+  "summat": ["8,5 milj. € tulos", "23,9 milj. € vuosikate"],
+  "osastot": ["kaupunki ja liikelaitos", "konserni"],
+  "avainluvut": {
+    "tulos": "8,5 M€",
+    "vuosikate": "23,9 M€",
+    "lainakanta_per_asukas": "5 483 €",
+    "toimintakate": "-123,7 M€",
+    "verotulot": "116,3 M€",
+    "investointimenot": "38,2 M€",
+    "omavaraisuusaste": "44,9 %"
+  },
+  "yhteenveto": "Lyhyt 1-2 lauseen yhteenveto tuloksesta"
+}
+
+Raportin teksti:
+${text.slice(0, 8000)}`
       }],
-      'Olet Kokkolan kaupungin taloushallinnon asiantuntija. Poimit dataa dokumenteista tarkasti JSON-muodossa.'
+      'Olet Kokkolan kaupungin taloushallinnon asiantuntija. Poimit talouslukuja raporteista tarkasti JSON-muodossa.'
     );
 
-    const text = (result.content || []).filter(b => b.type === 'text').map(b => b.text).join('');
-    const clean = text.replace(/```json|```/g, '').trim();
-    const data = JSON.parse(clean);
+    const rawText = (result.content || []).filter(b => b.type === 'text').map(b => b.text).join('');
+    const clean   = rawText.replace(/```json|```/g, '').trim();
 
-    if (data.tyyppi && data.tyyppi !== 'ei_relevantti') {
-      await supabaseRequest('talousdata?on_conflict=kokous_id', 'POST',
-        { kokous_id: kokousId, kokous_pvm: kokousPvm, raportti_tyyppi: data.tyyppi, data: JSON.stringify(data) });
-      Logger.info('Saved financial data', { kokousId, type: data.tyyppi });
-    } else {
-      Logger.info('PDF not relevant', { kokousId });
+    let data;
+    try {
+      data = JSON.parse(clean);
+    } catch (e) {
+      const start = clean.indexOf('{'), end = clean.lastIndexOf('}');
+      if (start !== -1 && end !== -1) data = JSON.parse(clean.slice(start, end + 1));
+      else { Logger.error('JSON parse failed', { itemId }); return; }
     }
-  } catch (err) { Logger.error('PDF parse error', { kokousId, error: err.message }); }
+
+    await supabaseRequest('talousdata?on_conflict=kokous_id', 'POST',
+      { kokous_id: itemId, kokous_pvm: kokousPvm, raportti_tyyppi: 'talousraportti', data: JSON.stringify(data) }
+    );
+    Logger.info('Saved financial report', { itemId, kuukausi: data.kuukausi });
+
+  } catch (err) {
+    Logger.error('parseMeetingItemText error', { itemId, error: err.message });
+  }
 }
 
 // ============================================================================
@@ -378,10 +422,11 @@ async function getMeetingItemIds(meetingId) {
   try {
     const buffer = await fetchBuffer(`https://kokkola10.oncloudos.com/cgi/DREQUEST.PHP?page=meeting&id=${encodeURIComponent(meetingId)}`);
     const html = buffer.toString('latin1');
-    const regex = /page=meetingitem&amp;id=(\d+-\d+)/g;
+    const regex = /page=meetingitem(?:&amp;|&)id=(\d+-\d+)/g;
     const ids = new Set();
     let match;
     while ((match = regex.exec(html)) !== null) ids.add(match[1]);
+    Logger.info('Found item IDs', { meetingId, count: ids.size });
     return Array.from(ids);
   } catch (err) {
     Logger.error('getMeetingItemIds error', { meetingId, error: err.message });
@@ -390,12 +435,12 @@ async function getMeetingItemIds(meetingId) {
 }
 
 // ============================================================================
-// KAUPUNGINHALLITUS PDF CHECKING
+// KAUPUNGINHALLITUS REPORT CHECKING
 // ============================================================================
 
 async function checkKaupunginhallitusPdfs() {
-  if (!ANTHROPIC_KEY) { Logger.warn('ANTHROPIC_KEY not set, skipping PDF check'); return; }
-  Logger.info('Checking kaupunginhallitus PDFs');
+  if (!ANTHROPIC_KEY) { Logger.warn('ANTHROPIC_KEY not set, skipping check'); return; }
+  Logger.info('Checking kaupunginhallitus reports');
 
   try {
     const buffer = await fetchBuffer(FEEDS['/agendas']);
@@ -415,13 +460,12 @@ async function checkKaupunginhallitusPdfs() {
 
         Logger.info('Processing meeting', { meetingId, kokousPvm });
         const itemIds = await getMeetingItemIds(meetingId);
-        Logger.info('Found item IDs', { meetingId, count: itemIds.length, ids: itemIds.slice(0, 5) });
 
         for (const itemId of itemIds) {
           try {
             const existing = await supabaseGet(`talousdata?kokous_id=eq.${encodeURIComponent(itemId)}&select=id`);
-            if (existing.length > 0) { Logger.info('Item already processed', { itemId }); continue; }
-            await parsePdfWithClaude(`https://kokkola10.oncloudos.com/kokous/${encodeURIComponent(itemId)}.PDF`, itemId, kokousPvm);
+            if (existing.length > 0) { Logger.debug('Item already processed', { itemId }); continue; }
+            await parseMeetingItemText(itemId, kokousPvm);
             await sleep(CONFIG.PDF_REQUEST_DELAY_MS);
           } catch (err) { Logger.error('Error processing item', { itemId, error: err.message }); }
         }
@@ -606,20 +650,6 @@ const server = http.createServer(async (req, res) => {
       res.statusCode = 202;
       res.end(JSON.stringify({ message: 'News sync started' }));
       syncNews().catch(err => Logger.error('Async news sync error', err));
-      return;
-    }
-
-    if (req.url === '/talousdata') {
-      try {
-        const data = await supabaseGet(
-          'talousdata?select=kokous_id,kokous_pvm,raportti_tyyppi,data&order=kokous_pvm.desc&limit=20'
-        );
-        res.statusCode = 200;
-        res.end(JSON.stringify(data));
-      } catch (err) {
-        Logger.error('Talousdata fetch error', err);
-        sendError(res, 500, 'Failed to fetch talousdata');
-      }
       return;
     }
 
