@@ -415,11 +415,12 @@ async function checkKaupunginhallitusPdfs() {
 
         Logger.info('Processing meeting', { meetingId, kokousPvm });
         const itemIds = await getMeetingItemIds(meetingId);
+        Logger.info('Found item IDs', { meetingId, count: itemIds.length, ids: itemIds.slice(0, 5) });
 
         for (const itemId of itemIds) {
           try {
             const existing = await supabaseGet(`talousdata?kokous_id=eq.${encodeURIComponent(itemId)}&select=id`);
-            if (existing.length > 0) { Logger.debug('Item already processed', { itemId }); continue; }
+            if (existing.length > 0) { Logger.info('Item already processed', { itemId }); continue; }
             await parsePdfWithClaude(`https://kokkola10.oncloudos.com/kokous/${encodeURIComponent(itemId)}.PDF`, itemId, kokousPvm);
             await sleep(CONFIG.PDF_REQUEST_DELAY_MS);
           } catch (err) { Logger.error('Error processing item', { itemId, error: err.message }); }
