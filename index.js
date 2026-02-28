@@ -608,6 +608,20 @@ const server = http.createServer(async (req, res) => {
       return;
     }
 
+    if (req.url === '/talousdata') {
+      try {
+        const data = await supabaseGet(
+          'talousdata?select=kokous_id,kokous_pvm,raportti_tyyppi,data&order=kokous_pvm.desc&limit=20'
+        );
+        res.statusCode = 200;
+        res.end(JSON.stringify(data));
+      } catch (err) {
+        Logger.error('Talousdata fetch error', err);
+        sendError(res, 500, 'Failed to fetch talousdata');
+      }
+      return;
+    }
+
     if (req.url === '/stats') {
       try {
         const data = await getStats();
@@ -620,12 +634,10 @@ const server = http.createServer(async (req, res) => {
       return;
     }
 
-    if (req.url.match(/^\/news\/(arctial|kokkola)(\?.*)?$/)) {
-      const urlObj = new URL(req.url, 'http://localhost');
-      const aihe   = urlObj.pathname.split('/')[2];
-      const limit  = Math.min(parseInt(urlObj.searchParams.get('limit') || '10', 10) || 10, 100);
+    if (req.url.match(/^\/news\/(arctial|kokkola)$/)) {
+      const aihe = req.url.split('/')[2];
       try {
-        const data = await supabaseGet(`uutiset?aihe=eq.${encodeURIComponent(aihe)}&order=id.desc&limit=${limit}`);
+        const data = await supabaseGet(`uutiset?aihe=eq.${encodeURIComponent(aihe)}&order=id.desc&limit=10`);
         res.statusCode = 200;
         res.end(JSON.stringify(data));
       } catch (err) {
