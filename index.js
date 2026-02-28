@@ -331,42 +331,49 @@ async function fetchNews(aihe, query) {
 }
 
 // ============================================================================
-// MEETING ITEM TEXT PARSING
+// KAUPUNGINHALLITUS REPORT CHECKING
 // ============================================================================
 
-function extractTextFromHtml(html) {
-  return html
-    .replace(/<script[\s\S]*?<\/script>/gi, '')
-    .replace(/<style[\s\S]*?<\/style>/gi, '')
-    .replace(/<[^>]+>/g, ' ')
-    .replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&nbsp;/g, ' ')
-    .replace(/\s{2,}/g, ' ')
-    .trim();
-}
-
-async function parseMeetingItemText(itemId, kokousPvm) {
-  if (!ANTHROPIC_KEY) { Logger.warn('ANTHROPIC_KEY not set, skipping parse'); return; }
+async function checkKaupunginhallitusPdfs() {
+  if (!ANTHROPIC_KEY) { Logger.warn('ANTHROPIC_KEY not set, skipping check'); return; }
+  Logger.info('Checking kaupunginhallitus reports from RSS feed');
 
   try {
-    const buffer = await fetchBuffer(
-      `https://kokkola10.oncloudos.com/cgi/DREQUEST.PHP?page=meetingitem&id=${encodeURIComponent(itemId)}`
-    );
-    const html = buffer.toString('latin1');
-    const text = extractTextFromHtml(html);
+    // Haetaan meetings-feedistä talousraportit suoraan
+    const buffer = await fetchBuffer(FEEDS['/meetings']);
+    const items  = parseRSS(buffer);
 
-    const isFinancialReport = text.toLowerCase().includes('talous- ja henkilöstöraportti') ||
-                              text.toLowerCase().includes('talousraportti');
-    Logger.info('Item text check', { itemId, isFinancialReport, preview: text.slice(0, 200).replace(/\s+/g, ' ') });
-    if (!isFinancialReport) {
+    const talousItems = items.filter(item =>
+      item.otsikko && (
+        item.otsikko.toLowerCase().includes('talous- ja henkilöstöraportti') ||
+        item.otsikko.toLowerCase().includes('talousraportti') ||
+        item.otsikko.toLowerCase().includes('talous- ja henkil')
+      )
+    );
+
+    Logger.info('Found financial report items in RSS', { count: talousItems.length });
+    if (!talousItems.length) {
+      Logger.warn('No financial report items found in meetings RSS');
       return;
     }
 
-    Logger.info('Parsing financial report', { itemId, kokousPvm });
+    for (const item of talousItems.slice(0, 3)) {
+      try {
+        const itemId = item.ulkoinen_id || item.linkki;
+        if (!itemId) continue;
 
-    const result = await callClaude(
-      [{
-        role: 'user',
-        content: `Lue tämä Kokkolan kaupunginhallituksen talous- ja henkilöstöraportti ja poimi keskeiset talousluvut. Palauta VAIN JSON-objekti ilman mitään muuta tekstiä tai markdownia.
+        const existing = await supabaseGet(`talousdata?kokous_id=eq.${encodeURIComponent(itemId)}&select=id`);
+        if (existing.length > 0) { Logger.info('Already processed', { itemId }); continue; }
+
+        const text = (item.otsikko + ' ' + (item.kuvaus || '')).trim();
+        if (text.length < 50) { Logger.warn('Too little text in RSS item', { itemId }); continue; }
+
+        Logger.info('Parsing financial report from RSS', { itemId, otsikko: item.otsikko });
+
+        const result = await callClaude(
+          [{
+            role: 'user',
+            content: `Lue tämä Kokkolan kaupunginhallituksen talous- ja henkilöstöraportti ja poimi keskeiset talousluvut. Palauta VAIN JSON-objekti ilman mitään muuta tekstiä tai markdownia.
 
 JSON-rakenne:
 {
@@ -388,90 +395,30 @@ JSON-rakenne:
 
 Raportin teksti:
 ${text.slice(0, 8000)}`
-      }],
-      'Olet Kokkolan kaupungin taloushallinnon asiantuntija. Poimit talouslukuja raporteista tarkasti JSON-muodossa.'
-    );
+          }],
+          'Olet Kokkolan kaupungin taloushallinnon asiantuntija. Poimit talouslukuja raporteista tarkasti JSON-muodossa.'
+        );
 
-    const rawText = (result.content || []).filter(b => b.type === 'text').map(b => b.text).join('');
-    const clean   = rawText.replace(/```json|```/g, '').trim();
+        const rawText = (result.content || []).filter(b => b.type === 'text').map(b => b.text).join('');
+        const clean   = rawText.replace(/```json|```/g, '').trim();
 
-    let data;
-    try {
-      data = JSON.parse(clean);
-    } catch (e) {
-      const start = clean.indexOf('{'), end = clean.lastIndexOf('}');
-      if (start !== -1 && end !== -1) data = JSON.parse(clean.slice(start, end + 1));
-      else { Logger.error('JSON parse failed', { itemId }); return; }
-    }
-
-    await supabaseRequest('talousdata?on_conflict=kokous_id', 'POST',
-      { kokous_id: itemId, kokous_pvm: kokousPvm, raportti_tyyppi: 'talousraportti', data: JSON.stringify(data) }
-    );
-    Logger.info('Saved financial report', { itemId, kuukausi: data.kuukausi });
-
-  } catch (err) {
-    Logger.error('parseMeetingItemText error', { itemId, error: err.message });
-  }
-}
-
-// ============================================================================
-// MEETING PARSING
-// ============================================================================
-
-async function getMeetingItemIds(meetingId) {
-  try {
-    const buffer = await fetchBuffer(`https://kokkola10.oncloudos.com/cgi/DREQUEST.PHP?page=meeting&id=${encodeURIComponent(meetingId)}`);
-    const html = buffer.toString('latin1');
-    const regex = /page=meetingitem(?:&amp;|&)id=(\d+-\d+)/g;
-    const ids = new Set();
-    let match;
-    while ((match = regex.exec(html)) !== null) ids.add(match[1]);
-    Logger.info('Found item IDs', { meetingId, count: ids.size });
-    return Array.from(ids);
-  } catch (err) {
-    Logger.error('getMeetingItemIds error', { meetingId, error: err.message });
-    return [];
-  }
-}
-
-// ============================================================================
-// KAUPUNGINHALLITUS REPORT CHECKING
-// ============================================================================
-
-async function checkKaupunginhallitusPdfs() {
-  if (!ANTHROPIC_KEY) { Logger.warn('ANTHROPIC_KEY not set, skipping check'); return; }
-  Logger.info('Checking kaupunginhallitus reports');
-
-  try {
-    const buffer = await fetchBuffer(FEEDS['/agendas']);
-    const items = parseRSS(buffer);
-    const khMeetings = items.filter(item => item.otsikko.toLowerCase().includes('kaupunginhallitus'));
-    Logger.info('Found KH meetings', { count: khMeetings.length });
-
-    for (const meeting of khMeetings.slice(0, 2)) {
-      try {
-        const idMatch = meeting.linkki.match(/id=(\d+)/);
-        if (!idMatch) continue;
-        const meetingId = idMatch[1];
-        const dateMatch = meeting.otsikko.match(/(\d{1,2})\.(\d{1,2})\.(\d{4})/);
-        const kokousPvm = dateMatch
-          ? `${dateMatch[3]}-${dateMatch[2].padStart(2, '0')}-${dateMatch[1].padStart(2, '0')}`
-          : null;
-
-        Logger.info('Processing meeting', { meetingId, kokousPvm });
-        const itemIds = await getMeetingItemIds(meetingId);
-
-        let loggedFirst = false;
-        for (const itemId of itemIds) {
-          try {
-            const existing = await supabaseGet(`talousdata?kokous_id=eq.${encodeURIComponent(itemId)}&select=id`);
-            if (existing.length > 0) { Logger.debug('Item already processed', { itemId }); continue; }
-            if (!loggedFirst) { Logger.info('First item sample', { itemId }); loggedFirst = true; }
-            await parseMeetingItemText(itemId, kokousPvm);
-            await sleep(CONFIG.PDF_REQUEST_DELAY_MS);
-          } catch (err) { Logger.error('Error processing item', { itemId, error: err.message }); }
+        let data;
+        try {
+          data = JSON.parse(clean);
+        } catch (e) {
+          const start = clean.indexOf('{'), end = clean.lastIndexOf('}');
+          if (start !== -1 && end !== -1) data = JSON.parse(clean.slice(start, end + 1));
+          else { Logger.error('JSON parse failed', { itemId }); continue; }
         }
-      } catch (err) { Logger.error('Error processing meeting', { error: err.message }); }
+
+        let kokousPvm = item.julkaistu || null;
+        await supabaseRequest('talousdata?on_conflict=kokous_id', 'POST',
+          { kokous_id: itemId, kokous_pvm: kokousPvm, raportti_tyyppi: 'talousraportti', data: JSON.stringify(data) }
+        );
+        Logger.info('Saved financial report', { itemId, kuukausi: data.kuukausi });
+        await sleep(CONFIG.PDF_REQUEST_DELAY_MS);
+
+      } catch (err) { Logger.error('Error processing financial item', { error: err.message }); }
     }
   } catch (err) { Logger.error('checkKaupunginhallitusPdfs error', err); }
 }
