@@ -11,7 +11,7 @@ const CONFIG = {
   CLAUDE_MAX_TOKENS: 2048,
   PDF_MIN_SIZE: 1000,
   PDF_REQUEST_DELAY_MS: 1500,
-  NEWS_SYNC_INTERVAL_MS: 2 * 24 * 60 * 60 * 1000,  // joka toinen päivä
+  NEWS_SYNC_INTERVAL_MS: 24 * 60 * 60 * 1000,
   FEED_SYNC_INTERVAL_MS: 60 * 60 * 1000,
   HTTP_TIMEOUT_MS: 30000,
   REQUEST_RETRY_ATTEMPTS: 3,
@@ -148,7 +148,8 @@ function supabaseRequest(path, method = 'GET', body = null) {
           'Content-Type': 'application/json',
           'apikey': SUPABASE_SERVICE_KEY,
           'Authorization': `Bearer ${SUPABASE_SERVICE_KEY}`,
-          'Prefer': 'resolution=merge-duplicates'
+          'Prefer': 'resolution=merge-duplicates',
+          'Range-Unit': 'items'
         },
         timeout: CONFIG.HTTP_TIMEOUT_MS
       };
@@ -286,9 +287,9 @@ async function fetchNews(aihe, query) {
     const result = await callClaude(
       [{
         role: 'user',
-        content: `Search for the latest news about: ${query}. Use web_search once to find recent news. Then respond with ONLY a raw JSON array with no markdown formatting and no other text. Each item must have: otsikko (string), url (string), kuvaus (string), julkaistu (date string YYYY-MM-DD or empty).`
+        content: `Search for the latest news about: ${query}. Search multiple times to find news from different sources like news sites, press releases, LinkedIn, and official announcements. After using web_search tool (use it 2-3 times with different queries), you MUST respond with ONLY a raw JSON array with no markdown formatting and no other text. Each item must have: otsikko (string), url (string), kuvaus (string), julkaistu (date string YYYY-MM-DD or empty).`
       }],
-      'You are a news search assistant. Use web_search once, then respond with ONLY a raw JSON array with no markdown, code blocks, or other text.',
+      'You are a news search assistant. Search broadly for news from many different sources. After using web_search tool (use it 2-3 times with different queries), you MUST respond with ONLY a raw JSON array with no markdown, code blocks, or other text.',
       tools
     );
 
@@ -453,9 +454,11 @@ async function syncFeeds() {
 async function syncNews() {
   Logger.info('Starting news sync');
   try {
-    await fetchNews('arctial', 'Arctial alumiinitehdas Kokkola site:yle.fi OR site:keskipohjanmaa.fi OR site:kauppalehti.fi OR site:arctial.com');
+    await fetchNews('arctial', 'Arctial alumiinitehdas Kokkola 2026');
+    await sleep(2000);
+    await fetchNews('arctial2', 'Arctial Kokkola site:yle.fi OR site:keskipohjanmaa.fi OR site:kauppalehti.fi OR site:talouselama.fi');
     await sleep(3000);
-    await fetchNews('kokkola', 'Kokkola uutiset 2026 site:yle.fi OR site:keskipohjanmaa.fi OR site:kokkola.fi');
+    await fetchNews('kokkola', '"Kokkola" uutiset 2026 site:yle.fi OR site:keskipohjanmaa.fi OR site:kokkola.fi OR site:ampparit.com/kokkola');
     Logger.info('News sync completed');
   } catch (err) { Logger.error('syncNews error', err); }
 }
@@ -618,12 +621,15 @@ const server = http.createServer(async (req, res) => {
       return;
     }
 
-    if (req.url.match(/^\/news\/(arctial|kokkola)$/)) {
-      const aihe = req.url.split('/')[2];
+    if (req.url.match(/^\/news\/(arctial|kokkola)(\?.*)?$/)) {
+      const aihe = req.url.split('/')[2].split('?')[0];
+      const urlParams = new URL('http://x' + req.url).searchParams;
+      const limit = Math.min(parseInt(urlParams.get('limit') || '10'), 100);
       try {
-        const data = await supabaseGet(`uutiset?aihe=eq.${encodeURIComponent(aihe)}&order=id.desc&limit=10`);
+        const data = await supabaseGet(`uutiset?aihe=eq.${encodeURIComponent(aihe)}&order=id.desc&limit=${limit}&offset=0`);
+        const limited = Array.isArray(data) ? data.slice(0, limit) : data;
         res.statusCode = 200;
-        res.end(JSON.stringify(data));
+        res.end(JSON.stringify(limited));
       } catch (err) {
         Logger.error('News fetch error', { aihe, error: err.message });
         sendError(res, 500, 'Failed to fetch news');
