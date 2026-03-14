@@ -286,73 +286,68 @@ async function fetchNews(aihe, query, konteksti) {
     const result = await callClaude(
       [{
         role: 'user',
-        content: `Search for the latest news about: ${query}. Use web_search once to find recent news. Then respond with ONLY a raw JSON array with no markdown formatting and no other text. Each item must have: otsikko (string), url (string), kuvaus (string), julkaistu (date string YYYY-MM-DD or empty).`
+        content: `Search for the latest news about: ${query}. Use web_search once. Respond with ONLY a raw JSON array, no markdown. Each item: otsikko (string), url (string), kuvaus (string), julkaistu (YYYY-MM-DD or empty).`
       }],
-      'You are a news search assistant. Use web_search once, then respond with ONLY a raw JSON array with no markdown, code blocks, or other text.',
+      'You are a news search assistant. Use web_search once, then respond with ONLY a raw JSON array. No markdown, no code blocks.',
       tools
     );
 
     const textBlocks = (result.content || []).filter(b => b.type === 'text');
-    const text = textBlocks.map(b => b.text).join('');
+    const text  = textBlocks.map(b => b.text).join('');
     const clean = text.replace(/```json|```/g, '').trim();
 
     let news;
-    try {
-      news = JSON.parse(clean);
-    } catch (err) {
+    try { news = JSON.parse(clean); }
+    catch (err) {
       const start = clean.indexOf('['), end = clean.lastIndexOf(']');
       if (start !== -1 && end !== -1 && end > start) {
         try { news = JSON.parse(clean.slice(start, end + 1)); }
-        catch (parseErr) { Logger.error('JSON parse error for news', { aihe, error: parseErr.message }); return; }
-      } else {
-        Logger.error('No JSON array found in response', { aihe, preview: clean.slice(0, 300) });
-        return;
-      }
+        catch (e) { Logger.error('JSON parse error', { aihe }); return; }
+      } else { Logger.error('No JSON array found', { aihe, preview: clean.slice(0, 200) }); return; }
     }
 
     if (!Array.isArray(news)) { Logger.error('Invalid news format', { aihe }); return; }
+    Logger.info('Raw news fetched', { aihe, count: news.length });
 
-    // Relevanssiarviointi
-    if (news.length > 0 && konteksti) {
+    // Relevanssiarviointi — vain jos konteksti annettu ja uutisia löytyi
+    if (konteksti && news.length > 0) {
       try {
         const arviointiPrompt = `${konteksti}
 
-Arvioi alla olevien uutisten relevanssi asteikolla 1-5 (5=erittäin relevantti, 1=ei relevantti).
-Palauta VAIN JSON-array jossa jokainen alkio on numero (relevanssipistemäärä), samassa järjestyksessä kuin uutiset.
+Arvioi jokaisen uutisen relevanssi asteikolla 1-5. Ole antelias — anna 3+ jos uutinen liittyy edes etäisesti aiheeseen.
+Palauta VAIN JSON-array numeroita, esim: [4,2,5,3,1,4]
 
 Uutiset:
 ${news.map((n, i) => `${i}. "${n.otsikko}" — ${n.kuvaus || ''}`).join('\n')}`;
 
         const arvioResult = await callClaude(
           [{ role: 'user', content: arviointiPrompt }],
-          'Palauta VAIN JSON-array numeroista, ei muuta tekstiä. Esimerkki: [4,2,5,1,3]'
+          'Palauta VAIN JSON-array numeroista. Esimerkki: [4,2,5,1,3]'
         );
-        const arvioText = (arvioResult.content || []).filter(b => b.type === 'text').map(b => b.text).join('');
+        const arvioText  = (arvioResult.content || []).filter(b => b.type === 'text').map(b => b.text).join('');
         const arvioClean = arvioText.replace(/```json|```/g, '').trim();
         let arviot;
         try { arviot = JSON.parse(arvioClean); }
         catch (e) {
           const s = arvioClean.indexOf('['), en = arvioClean.lastIndexOf(']');
-          if (s !== -1 && en !== -1) arviot = JSON.parse(arvioClean.slice(s, en + 1));
+          if (s !== -1 && en !== -1) try { arviot = JSON.parse(arvioClean.slice(s, en + 1)); } catch (_) {}
         }
-        if (Array.isArray(arviot)) {
+        if (Array.isArray(arviot) && arviot.length > 0) {
           const ennen = news.length;
           news = news.filter((_, i) => {
-            const score = typeof arviot[i] === 'number' ? arviot[i] : (arviot[i]?.relevanssi || 0);
-            return score >= 3;
+            const score = typeof arviot[i] === 'number' ? arviot[i] : (arviot[i]?.relevanssi || 3);
+            return score >= 2;
           });
           Logger.info('Relevance filter', { aihe, ennen, jälkeen: news.length });
         }
       } catch (err) {
-        Logger.warn('Relevance scoring failed, using all news', { aihe, error: err.message });
+        Logger.warn('Relevance scoring failed, keeping all', { aihe, error: err.message });
       }
     }
 
-    const saveAihe = aihe === 'arctial2' ? 'arctial' : aihe;
-    if (aihe !== 'arctial2') {
-      try { await supabaseRequest(`uutiset?aihe=eq.${encodeURIComponent(saveAihe)}`, 'DELETE', {}); }
-      catch (err) { Logger.warn('Failed to delete old news', { aihe, error: err.message }); }
-    }
+    const saveAihe = aihe;
+    try { await supabaseRequest(`uutiset?aihe=eq.${encodeURIComponent(saveAihe)}`, 'DELETE', {}); }
+    catch (err) { Logger.warn('Failed to delete old news', { aihe, error: err.message }); }
 
     const newsToSave = news
       .filter(item => item.otsikko && item.url)
@@ -486,18 +481,18 @@ async function syncFeeds() {
 async function syncNews() {
   Logger.info('Starting news sync');
 
-  const arctialKonteksti = `Arctial on suomalainen yritys joka rakentaa alumiinisulattoa Kokkolaan, Suomeen. 
-Relevantit uutiset koskevat: Arctialin investointia, rakentamista, rahoitusta, työpaikkoja, ympäristölupaa, tai alumiiniteollisuutta Kokkolassa.
-Ei-relevantit: muut alumiiniyritykset maailmalla, aiheet joissa Arctial mainitaan vain sivuhuomautuksena.`;
+  const arctialKonteksti = `Arctial on suomalainen yritys joka rakentaa alumiinisulattoa Kokkolaan, Suomeen.
+Relevantit uutiset (anna 3-5): investointi, rakentaminen, rahoitus, luvat, työpaikat, alumiini Kokkola, Arctial-yhtiö.
+Ei-relevantit (anna 1-2): muut alumiiniyritykset, aiheet joissa Arctial mainitaan vain sivuhuomautuksena.`;
 
   const kokkolaKonteksti = `Kokkola on noin 47 000 asukkaan rannikkokaupunki Keski-Pohjanmaalla, Suomessa.
-Relevantit uutiset koskevat: Kokkolan kaupungin päätöksiä, paikallispolitiikkaa, infrastruktuuria, paikallisia yrityksiä, satamaa, koulutusta tai asukkaita.
-Ei-relevantit: uutiset joissa Kokkola mainitaan vain ohimennen, tai jotka koskevat muita samannimisiä paikkoja.`;
+Relevantit uutiset (anna 3-5): kaupungin päätökset, paikallispolitiikka, infrastruktuuri, paikalliset yritykset, satama, koulutus, asukkaat.
+Ei-relevantit (anna 1-2): uutiset joissa Kokkola mainitaan vain ohimennen tai koskevat muita samannimisiä paikkoja.`;
 
   try {
-    await fetchNews('arctial', 'Arctial aluminium smelter Kokkola Finland 2026', arctialKonteksti);
+    await fetchNews('arctial', 'Arctial alumiinisulatto Kokkola 2026', arctialKonteksti);
     await sleep(3000);
-    await fetchNews('kokkola', 'Kokkola kaupunki 2026', kokkolaKonteksti);
+    await fetchNews('kokkola', 'Kokkola kaupunki uutiset 2026', kokkolaKonteksti);
     Logger.info('News sync completed');
   } catch (err) { Logger.error('syncNews error', err); }
 }
