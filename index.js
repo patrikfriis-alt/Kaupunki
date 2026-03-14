@@ -148,8 +148,7 @@ function supabaseRequest(path, method = 'GET', body = null) {
           'Content-Type': 'application/json',
           'apikey': SUPABASE_SERVICE_KEY,
           'Authorization': `Bearer ${SUPABASE_SERVICE_KEY}`,
-          'Prefer': 'resolution=merge-duplicates',
-          'Range-Unit': 'items'
+          'Prefer': 'resolution=merge-duplicates'
         },
         timeout: CONFIG.HTTP_TIMEOUT_MS
       };
@@ -458,7 +457,7 @@ async function syncNews() {
     await sleep(2000);
     await fetchNews('arctial2', 'Arctial Kokkola site:yle.fi OR site:keskipohjanmaa.fi OR site:kauppalehti.fi OR site:talouselama.fi');
     await sleep(3000);
-    await fetchNews('kokkola', '"Kokkola" uutiset 2026 site:yle.fi OR site:keskipohjanmaa.fi OR site:kokkola.fi OR site:ampparit.com/kokkola');
+    await fetchNews('kokkola', 'Kokkola kaupunki uutiset 2026');
     Logger.info('News sync completed');
   } catch (err) { Logger.error('syncNews error', err); }
 }
@@ -621,15 +620,12 @@ const server = http.createServer(async (req, res) => {
       return;
     }
 
-    if (req.url.match(/^\/news\/(arctial|kokkola)(\?.*)?$/)) {
-      const aihe = req.url.split('/')[2].split('?')[0];
-      const urlParams = new URL('http://x' + req.url).searchParams;
-      const limit = Math.min(parseInt(urlParams.get('limit') || '10'), 100);
+    if (req.url.match(/^\/news\/(arctial|kokkola)$/)) {
+      const aihe = req.url.split('/')[2];
       try {
-        const data = await supabaseGet(`uutiset?aihe=eq.${encodeURIComponent(aihe)}&order=id.desc&limit=${limit}&offset=0`);
-        const limited = Array.isArray(data) ? data.slice(0, limit) : data;
+        const data = await supabaseGet(`uutiset?aihe=eq.${encodeURIComponent(aihe)}&order=id.desc&limit=10`);
         res.statusCode = 200;
-        res.end(JSON.stringify(limited));
+        res.end(JSON.stringify(data));
       } catch (err) {
         Logger.error('News fetch error', { aihe, error: err.message });
         sendError(res, 500, 'Failed to fetch news');
