@@ -276,7 +276,7 @@ function callClaude(messages, systemPrompt, tools = null) {
 // NEWS FETCHING
 // ============================================================================
 
-async function fetchNews(aihe, query) {
+async function fetchNews(aihe, query, konteksti) {
   if (!ANTHROPIC_KEY) { Logger.warn('ANTHROPIC_KEY not set, skipping news fetch'); return; }
   Logger.info('Fetching news', { aihe, query });
 
@@ -286,24 +286,21 @@ async function fetchNews(aihe, query) {
     const result = await callClaude(
       [{
         role: 'user',
-        content: `Search for the latest news about: ${query}. Search multiple times to find news from different sources like news sites, press releases, LinkedIn, and official announcements. After using web_search tool (use it 2-3 times with different queries), you MUST respond with ONLY a raw JSON array with no markdown formatting and no other text. Each item must have: otsikko (string), url (string), kuvaus (string), julkaistu (date string YYYY-MM-DD or empty).`
+        content: `Search for the latest news about: ${query}. Use web_search once to find recent news. Then respond with ONLY a raw JSON array with no markdown formatting and no other text. Each item must have: otsikko (string), url (string), kuvaus (string), julkaistu (date string YYYY-MM-DD or empty).`
       }],
-      'You are a news search assistant. Search broadly for news from many different sources. After using web_search tool (use it 2-3 times with different queries), you MUST respond with ONLY a raw JSON array with no markdown, code blocks, or other text.',
+      'You are a news search assistant. Use web_search once, then respond with ONLY a raw JSON array with no markdown, code blocks, or other text.',
       tools
     );
 
     const textBlocks = (result.content || []).filter(b => b.type === 'text');
     const text = textBlocks.map(b => b.text).join('');
     const clean = text.replace(/```json|```/g, '').trim();
-    Logger.debug('Claude response', { aihe, preview: clean.slice(0, 300) });
 
     let news;
     try {
       news = JSON.parse(clean);
     } catch (err) {
-      // Etsi ensimmäinen [ ja viimeinen ] ja yritä parsia niiden välinen teksti
-      const start = clean.indexOf('[');
-      const end   = clean.lastIndexOf(']');
+      const start = clean.indexOf('['), end = clean.lastIndexOf(']');
       if (start !== -1 && end !== -1 && end > start) {
         try { news = JSON.parse(clean.slice(start, end + 1)); }
         catch (parseErr) { Logger.error('JSON parse error for news', { aihe, error: parseErr.message }); return; }
@@ -313,7 +310,43 @@ async function fetchNews(aihe, query) {
       }
     }
 
-    if (!Array.isArray(news)) { Logger.error('Invalid news format - not an array', { aihe }); return; }
+    if (!Array.isArray(news)) { Logger.error('Invalid news format', { aihe }); return; }
+
+    // Relevanssiarviointi
+    if (news.length > 0 && konteksti) {
+      try {
+        const arviointiPrompt = `${konteksti}
+
+Arvioi alla olevien uutisten relevanssi asteikolla 1-5 (5=erittäin relevantti, 1=ei relevantti).
+Palauta VAIN JSON-array jossa jokainen alkio on numero (relevanssipistemäärä), samassa järjestyksessä kuin uutiset.
+
+Uutiset:
+${news.map((n, i) => `${i}. "${n.otsikko}" — ${n.kuvaus || ''}`).join('\n')}`;
+
+        const arvioResult = await callClaude(
+          [{ role: 'user', content: arviointiPrompt }],
+          'Palauta VAIN JSON-array numeroista, ei muuta tekstiä. Esimerkki: [4,2,5,1,3]'
+        );
+        const arvioText = (arvioResult.content || []).filter(b => b.type === 'text').map(b => b.text).join('');
+        const arvioClean = arvioText.replace(/```json|```/g, '').trim();
+        let arviot;
+        try { arviot = JSON.parse(arvioClean); }
+        catch (e) {
+          const s = arvioClean.indexOf('['), en = arvioClean.lastIndexOf(']');
+          if (s !== -1 && en !== -1) arviot = JSON.parse(arvioClean.slice(s, en + 1));
+        }
+        if (Array.isArray(arviot)) {
+          const ennen = news.length;
+          news = news.filter((_, i) => {
+            const score = typeof arviot[i] === 'number' ? arviot[i] : (arviot[i]?.relevanssi || 0);
+            return score >= 3;
+          });
+          Logger.info('Relevance filter', { aihe, ennen, jälkeen: news.length });
+        }
+      } catch (err) {
+        Logger.warn('Relevance scoring failed, using all news', { aihe, error: err.message });
+      }
+    }
 
     const saveAihe = aihe === 'arctial2' ? 'arctial' : aihe;
     if (aihe !== 'arctial2') {
@@ -452,12 +485,19 @@ async function syncFeeds() {
 
 async function syncNews() {
   Logger.info('Starting news sync');
+
+  const arctialKonteksti = `Arctial on suomalainen yritys joka rakentaa alumiinisulattoa Kokkolaan, Suomeen. 
+Relevantit uutiset koskevat: Arctialin investointia, rakentamista, rahoitusta, työpaikkoja, ympäristölupaa, tai alumiiniteollisuutta Kokkolassa.
+Ei-relevantit: muut alumiiniyritykset maailmalla, aiheet joissa Arctial mainitaan vain sivuhuomautuksena.`;
+
+  const kokkolaKonteksti = `Kokkola on noin 47 000 asukkaan rannikkokaupunki Keski-Pohjanmaalla, Suomessa.
+Relevantit uutiset koskevat: Kokkolan kaupungin päätöksiä, paikallispolitiikkaa, infrastruktuuria, paikallisia yrityksiä, satamaa, koulutusta tai asukkaita.
+Ei-relevantit: uutiset joissa Kokkola mainitaan vain ohimennen, tai jotka koskevat muita samannimisiä paikkoja.`;
+
   try {
-    await fetchNews('arctial', 'Arctial alumiinitehdas Kokkola 2026');
-    await sleep(2000);
-    await fetchNews('arctial2', 'Arctial Kokkola site:yle.fi OR site:keskipohjanmaa.fi OR site:kauppalehti.fi OR site:talouselama.fi');
+    await fetchNews('arctial', 'Arctial aluminium smelter Kokkola Finland 2026', arctialKonteksti);
     await sleep(3000);
-    await fetchNews('kokkola', 'Kokkola kaupunki uutiset 2026');
+    await fetchNews('kokkola', 'Kokkola kaupunki 2026', kokkolaKonteksti);
     Logger.info('News sync completed');
   } catch (err) { Logger.error('syncNews error', err); }
 }
