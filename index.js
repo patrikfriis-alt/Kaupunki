@@ -677,7 +677,7 @@ const server = http.createServer(async (req, res) => {
           return;
         }
         const urlParsed = new URL(rssUrl);
-        const allowedDomains = ['feeds.yle.fi', 'www.ampparit.com'];
+        const allowedDomains = ['feeds.yle.fi', 'www.ampparit.com', 'news.google.com'];
         if (!allowedDomains.includes(urlParsed.hostname)) {
           sendError(res, 400, 'Domain not allowed');
           return;
