@@ -791,6 +791,11 @@ const server = http.createServer(async (req, res) => {
       try {
         const urlObj = new URL(req.url, 'http://localhost');
         const rssUrl = decodeURIComponent(urlObj.searchParams.get('url') || '');
+        console.log('[RSS] Raw url param:', req.query?.url || req.url);
+        console.log('[RSS] Decoded URL:', decodeURIComponent(req.query?.url || ''));
+        const testUrl = new URL(decodeURIComponent(req.query?.url || ''));
+        console.log('[RSS] Extracted domain:', testUrl.hostname);
+        console.log('[RSS] Allowed domains:', ALLOWED_RSS_DOMAINS);
         if (!rssUrl) {
           sendError(res, 400, 'Missing url parameter');
           return;
