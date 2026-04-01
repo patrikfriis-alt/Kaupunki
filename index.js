@@ -682,13 +682,25 @@ const server = http.createServer(async (req, res) => {
           sendError(res, 400, 'Domain not allowed');
           return;
         }
-        https.get(rssUrl, rssRes => {
+        const urlObj = new URL(rssUrl);
+        const options = {
+          hostname: urlObj.hostname,
+          path: urlObj.pathname + urlObj.search,
+          method: 'GET',
+          headers: {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'Accept': 'application/rss+xml, application/xml, text/xml, */*'
+          }
+        };
+        const req = https.request(options, rssRes => {
           res.setHeader('Content-Type', 'application/rss+xml');
           rssRes.pipe(res);
-        }).on('error', err => {
+        });
+        req.on('error', err => {
           Logger.error('RSS fetch error', { url: rssUrl, error: err.message });
           sendError(res, 500, 'Failed to fetch RSS');
         });
+        req.end();
       } catch (err) {
         Logger.error('RSS endpoint error', err);
         sendError(res, 400, 'Invalid URL');
