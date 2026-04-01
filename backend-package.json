@@ -1,0 +1,15 @@
+{
+  "name": "kaupunki-backend",
+  "version": "1.0.0",
+  "description": "Proxy-palvelin Kokkolan kaupungin päätösdatalle",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js",
+    "dev": "DEBUG=true node index.js"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "keywords": ["kokkola", "paatokset", "proxy"],
+  "license": "MIT"
+}
