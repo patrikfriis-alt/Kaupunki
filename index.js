@@ -801,10 +801,10 @@ const server = http.createServer(async (req, res) => {
           sendError(res, 400, 'Domain not allowed');
           return;
         }
-        const urlObj = new URL(rssUrl);
+        const rssUrlObj = new URL(rssUrl);
         const options = {
-          hostname: urlObj.hostname,
-          path: urlObj.pathname + urlObj.search,
+          hostname: rssUrlObj.hostname,
+          path: rssUrlObj.pathname + rssUrlObj.search,
           method: 'GET',
           headers: {
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
