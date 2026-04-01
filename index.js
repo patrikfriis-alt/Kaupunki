@@ -100,8 +100,10 @@ function fetchBuffer(url, attempt = 1) {
 // ============================================================================
 
 function parseRSS(buffer) {
-  // Dynasty käyttää aina iso-8859-1 — kovakoodataan latin1
-  const text = buffer.toString('latin1');
+  let text = buffer.toString('utf8');
+  if (!text.startsWith('<?xml')) {
+    text = '<?xml version="1.0" encoding="UTF-8"?>' + text;
+  }
   const items = [];
   const itemRegex = /<item>([\s\S]*?)<\/item>/g;
   let match;
@@ -129,6 +131,49 @@ function parseRSS(buffer) {
     }
   }
   return items;
+}
+
+async function fetchRSSNews(url, label) {
+  const proxyUrl = `http://localhost:${PORT}/rss?url=${encodeURIComponent(url)}`;
+  try {
+    const buffer = await fetchBuffer(proxyUrl);
+    const items = parseRSS(buffer);
+    return items.map(item => ({ ...item, url: item.linkki, source: label }));
+  } catch (err) {
+    Logger.warn(`Failed to fetch RSS from ${label}`, err);
+    return [];
+  }
+}
+
+async function fetchClaudeNews(query, konteksti, aihe) {
+  const tools = [{ type: 'web_search_20250305', name: 'web_search' }];
+
+  const result = await callClaude(
+    [{
+      role: 'user',
+      content: `Search for the latest news about: ${query}. Use web_search once. Respond with ONLY a raw JSON array, no markdown. Each item: otsikko (string), url (string), kuvaus (string), julkaistu (YYYY-MM-DD or empty).`
+    }],
+    'You are a news search assistant. Use web_search once, then respond with ONLY a raw JSON array. No markdown, no code blocks.',
+    tools
+  );
+
+  const textBlocks = (result.content || []).filter(b => b.type === 'text');
+  const text  = textBlocks.map(b => b.text).join('');
+  const clean = text.replace(/```json|```/g, '').trim();
+
+  let news;
+  try { news = JSON.parse(clean); }
+  catch (err) {
+    const start = clean.indexOf('['), end = clean.lastIndexOf(']');
+    if (start !== -1 && end !== -1 && end > start) {
+      try { news = JSON.parse(clean.slice(start, end + 1)); }
+      catch (e) { Logger.error('JSON parse error', { aihe }); return []; }
+    } else { Logger.error('No JSON array found', { aihe, preview: clean.slice(0, 200) }); return []; }
+  }
+
+  if (!Array.isArray(news)) { Logger.error('Invalid news format', { aihe }); return []; }
+
+  return news;
 }
 
 // ============================================================================
@@ -277,37 +322,52 @@ function callClaude(messages, systemPrompt, tools = null) {
 // ============================================================================
 
 async function fetchNews(aihe, query, konteksti) {
-  if (!ANTHROPIC_KEY) { Logger.warn('ANTHROPIC_KEY not set, skipping news fetch'); return; }
   Logger.info('Fetching news', { aihe, query });
 
   try {
-    const tools = [{ type: 'web_search_20250305', name: 'web_search' }];
+    let rssSources = [];
+    let useClaude = false;
 
-    const result = await callClaude(
-      [{
-        role: 'user',
-        content: `Search for the latest news about: ${query}. Use web_search once. Respond with ONLY a raw JSON array, no markdown. Each item: otsikko (string), url (string), kuvaus (string), julkaistu (YYYY-MM-DD or empty).`
-      }],
-      'You are a news search assistant. Use web_search once, then respond with ONLY a raw JSON array. No markdown, no code blocks.',
-      tools
-    );
-
-    const textBlocks = (result.content || []).filter(b => b.type === 'text');
-    const text  = textBlocks.map(b => b.text).join('');
-    const clean = text.replace(/```json|```/g, '').trim();
-
-    let news;
-    try { news = JSON.parse(clean); }
-    catch (err) {
-      const start = clean.indexOf('['), end = clean.lastIndexOf(']');
-      if (start !== -1 && end !== -1 && end > start) {
-        try { news = JSON.parse(clean.slice(start, end + 1)); }
-        catch (e) { Logger.error('JSON parse error', { aihe }); return; }
-      } else { Logger.error('No JSON array found', { aihe, preview: clean.slice(0, 200) }); return; }
+    if (aihe === 'kokkola') {
+      rssSources = [
+        { url: 'https://feeds.yle.fi/uutiset/v1/recent.rss?publisherIds=YLE_UUTISET&concepts=18-135629', label: 'YLE' },
+        { url: 'https://news.google.com/rss/search?q=kokkola&hl=fi-FI&gl=FI&ceid=FI:fi', label: 'Google' }
+      ];
+      useClaude = true;
+    } else if (aihe === 'arctial') {
+      rssSources = [
+        { url: 'https://news.google.com/rss/search?q=arctial&hl=fi-FI&gl=FI&ceid=FI:fi', label: 'Google' }
+      ];
+      useClaude = true;
     }
 
-    if (!Array.isArray(news)) { Logger.error('Invalid news format', { aihe }); return; }
+    let news = [];
+    if (rssSources.length > 0) {
+      const rssPromises = rssSources.map(source => fetchRSSNews(source.url, source.label));
+      const allRss = await Promise.all(rssPromises);
+      news.push(...allRss.flat());
+    }
+
+    if (useClaude) {
+      if (!ANTHROPIC_KEY) { Logger.warn('ANTHROPIC_KEY not set, skipping Claude news fetch'); }
+      else {
+        const claudeNews = await fetchClaudeNews(query, konteksti, aihe);
+        news.push(...claudeNews);
+      }
+    }
+
     Logger.info('Raw news fetched', { aihe, count: news.length });
+
+    // Deduplicate by title
+    const seen = new Set();
+    news = news.filter(item => {
+      if (seen.has(item.otsikko)) return false;
+      seen.add(item.otsikko);
+      return true;
+    });
+
+    // Sort by date descending
+    news.sort((a, b) => new Date(b.julkaistu || '1970-01-01') - new Date(a.julkaistu || '1970-01-01'));
 
     // Relevanssiarviointi — vain jos konteksti annettu ja uutisia löytyi
     if (konteksti && news.length > 0) {
