@@ -811,15 +811,15 @@ if (!rssUrl) {
             'Accept': 'application/rss+xml, application/xml, text/xml, */*'
           }
         };
-        const req = https.request(options, rssRes => {
+        const rssReq = https.request(options, rssRes => {
           res.setHeader('Content-Type', 'application/rss+xml');
           rssRes.pipe(res);
         });
-        req.on('error', err => {
+        rssReq.on('error', err => {
           Logger.error('RSS fetch error', { url: rssUrl, error: err.message });
           sendError(res, 500, 'Failed to fetch RSS');
         });
-        req.end();
+        rssReq.end();
       } catch (err) {
         Logger.error('RSS endpoint error', err);
         sendError(res, 400, 'Invalid URL');
