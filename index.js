@@ -668,6 +668,34 @@ const server = http.createServer(async (req, res) => {
       return;
     }
 
+    if (req.url.startsWith('/rss?')) {
+      try {
+        const urlObj = new URL(req.url, 'http://localhost');
+        const rssUrl = decodeURIComponent(urlObj.searchParams.get('url') || '');
+        if (!rssUrl) {
+          sendError(res, 400, 'Missing url parameter');
+          return;
+        }
+        const urlParsed = new URL(rssUrl);
+        const allowedDomains = ['feeds.yle.fi', 'www.ampparit.com'];
+        if (!allowedDomains.includes(urlParsed.hostname)) {
+          sendError(res, 400, 'Domain not allowed');
+          return;
+        }
+        https.get(rssUrl, rssRes => {
+          res.setHeader('Content-Type', 'application/rss+xml');
+          rssRes.pipe(res);
+        }).on('error', err => {
+          Logger.error('RSS fetch error', { url: rssUrl, error: err.message });
+          sendError(res, 500, 'Failed to fetch RSS');
+        });
+      } catch (err) {
+        Logger.error('RSS endpoint error', err);
+        sendError(res, 400, 'Invalid URL');
+      }
+      return;
+    }
+
     // Feed proxy
     const feedUrl = FEEDS[req.url] || FEEDS['/decisions'];
     https.get(feedUrl, rssRes => {
