@@ -836,9 +836,10 @@ const server = http.createServer(async (req, res) => {
       return;
     }
     https.get(feedUrl, rssRes => {
-      let data = '';
-      rssRes.on('data', chunk => data += chunk);
+      const chunks = [];
+      rssRes.on('data', chunk => chunks.push(chunk));
       rssRes.on('end', () => {
+        const data = Buffer.concat(chunks);
         rssCache.set(feedUrl, { data, timestamp: now });
         res.setHeader('Content-Type', 'application/xml; charset=iso-8859-1');
         res.end(data);
