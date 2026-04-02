@@ -21,6 +21,8 @@ const CONFIG = {
   RATE_LIMIT_WINDOW_MS: parseInt(process.env.RATE_LIMIT_WINDOW_MS) || 60 * 1000
 };
 
+let pdfParsingInProgress = false;
+
 const rateLimitMap = new Map();
 
 const rssCache = new Map();
@@ -529,39 +531,48 @@ async function getMeetingItemIds(meetingId) {
 // ============================================================================
 
 async function checkKaupunginhallitusPdfs() {
-  if (!ANTHROPIC_KEY) { Logger.warn('ANTHROPIC_KEY not set, skipping PDF check'); return; }
-  Logger.info('Checking kaupunginhallitus PDFs');
-
+  if (pdfParsingInProgress) {
+    Logger.warn('PDF parsing already in progress, skipping');
+    return;
+  }
+  pdfParsingInProgress = true;
   try {
-    const buffer = await fetchBuffer(FEEDS['/agendas']);
-    const items = parseRSS(buffer);
-    const khMeetings = items.filter(item => item.otsikko.toLowerCase().includes('kaupunginhallitus'));
-    Logger.info('Found KH meetings', { count: khMeetings.length });
+    if (!ANTHROPIC_KEY) { Logger.warn('ANTHROPIC_KEY not set, skipping PDF check'); return; }
+    Logger.info('Checking kaupunginhallitus PDFs');
 
-    for (const meeting of khMeetings.slice(0, 2)) {
-      try {
-        const idMatch = meeting.linkki.match(/id=(\d+)/);
-        if (!idMatch) continue;
-        const meetingId = idMatch[1];
-        const dateMatch = meeting.otsikko.match(/(\d{1,2})\.(\d{1,2})\.(\d{4})/);
-        const kokousPvm = dateMatch
-          ? `${dateMatch[3]}-${dateMatch[2].padStart(2, '0')}-${dateMatch[1].padStart(2, '0')}`
-          : null;
+    try {
+      const buffer = await fetchBuffer(FEEDS['/agendas']);
+      const items = parseRSS(buffer);
+      const khMeetings = items.filter(item => item.otsikko.toLowerCase().includes('kaupunginhallitus'));
+      Logger.info('Found KH meetings', { count: khMeetings.length });
 
-        Logger.info('Processing meeting', { meetingId, kokousPvm });
-        const itemIds = await getMeetingItemIds(meetingId);
+      for (const meeting of khMeetings.slice(0, 2)) {
+        try {
+          const idMatch = meeting.linkki.match(/id=(\d+)/);
+          if (!idMatch) continue;
+          const meetingId = idMatch[1];
+          const dateMatch = meeting.otsikko.match(/(\d{1,2})\.(\d{1,2})\.(\d{4})/);
+          const kokousPvm = dateMatch
+            ? `${dateMatch[3]}-${dateMatch[2].padStart(2, '0')}-${dateMatch[1].padStart(2, '0')}`
+            : null;
 
-        for (const itemId of itemIds) {
-          try {
-            const existing = await supabaseGet(`talousdata?kokous_id=eq.${encodeURIComponent(itemId)}&select=id`);
-            if (existing.length > 0) { Logger.debug('Item already processed', { itemId }); continue; }
-            await parsePdfWithClaude(`https://kokkola10.oncloudos.com/kokous/${encodeURIComponent(itemId)}.PDF`, itemId, kokousPvm);
-            await sleep(5000); // 5 sekuntia kutsujen väliin rate limitin välttämiseksi
-          } catch (err) { Logger.error('Error processing item', { itemId, error: err.message }); }
-        }
-      } catch (err) { Logger.error('Error processing meeting', { error: err.message }); }
-    }
-  } catch (err) { Logger.error('checkKaupunginhallitusPdfs error', err); }
+          Logger.info('Processing meeting', { meetingId, kokousPvm });
+          const itemIds = await getMeetingItemIds(meetingId);
+
+          for (const itemId of itemIds) {
+            try {
+              const existing = await supabaseGet(`talousdata?kokous_id=eq.${encodeURIComponent(itemId)}&select=id`);
+              if (existing.length > 0) { Logger.debug('Item already processed', { itemId }); continue; }
+              await parsePdfWithClaude(`https://kokkola10.oncloudos.com/kokous/${encodeURIComponent(itemId)}.PDF`, itemId, kokousPvm);
+              await sleep(5000); // 5 sekuntia kutsujen väliin rate limitin välttämiseksi
+            } catch (err) { Logger.error('Error processing item', { itemId, error: err.message }); }
+          }
+        } catch (err) { Logger.error('Error processing meeting', { error: err.message }); }
+      }
+    } catch (err) { Logger.error('checkKaupunginhallitusPdfs error', err); }
+  } finally {
+    pdfParsingInProgress = false;
+  }
 }
 
 // ============================================================================
