@@ -504,25 +504,79 @@ async function parsePdfWithClaude(pdfUrl, kokousId, kokousPvm) {
 // MEETING PARSING
 // ============================================================================
 
-async function getMeetingItemIds(meetingId) {
+async function getMeetingItems(meetingId) {
   try {
     const buffer = await fetchBuffer(
       `https://kokkola10.oncloudos.com/cgi/DREQUEST.PHP?page=meeting&id=${encodeURIComponent(meetingId)}`
     );
-    // Sivu on ISO-8859-1 — decode oikein
     const html = buffer.toString('latin1');
 
-    // Korjattu regex: matchaa sekä &id= että &amp;id=
-    const regex = /page=meetingitem&(?:amp;)?id=([\d]+-[\d]+)/g;
-    const ids = new Set();
+    // Matchaa sekä id että otsikko samasta ankkurista
+    const regex = /page=meetingitem&(?:amp;)?id=([\d]+-[\d]+)[^>]*>([^<]+)<\/a>/g;
+    const items = [];
     let match;
-    while ((match = regex.exec(html)) !== null) ids.add(match[1]);
+    while ((match = regex.exec(html)) !== null) {
+      items.push({ id: match[1], otsikko: match[2].trim() });
+    }
 
-    Logger.info('Found meeting item IDs', { meetingId, count: ids.size });
-    return Array.from(ids);
+    Logger.info('Found meeting items', {
+      meetingId,
+      count: items.length,
+      titles: items.map(i => i.otsikko)
+    });
+    return items;
   } catch (err) {
-    Logger.error('getMeetingItemIds error', { meetingId, error: err.message });
+    Logger.error('getMeetingItems error', { meetingId, error: err.message });
     return [];
+  }
+}
+
+async function filterRelevantItems(items) {
+  if (!ANTHROPIC_KEY || !items.length) return items;
+  try {
+    const prompt = `Arvioi onko kokousasiakirja taloudellisesti relevantti.
+
+Relevantti (true): budjetti, tilinpäätös, sopimus, investointi, hankinta, palkka, avustus, laina, talousarvio, henkilöstökertomus, vuosikate, rahoitus, myynti, osto, kilpailutus
+Ei relevantti (false): kokouksen avaus, laillisuus, päätösvaltaisuus, pöytäkirjan tarkastajat, tiedoksiannot, vaalitulokset, työjärjestys, tiedotettavat asiat, pöytäkirjajäljennökset
+
+Otsikot:
+${items.map((item, i) => `${i}. ${item.otsikko}`).join('\n')}
+
+Palauta VAIN JSON-array boolean-arvoja, yksi per otsikko, esim: [true, false, true, false]
+Ei muuta tekstiä.`;
+
+    const result = await callClaude(
+      [{ role: 'user', content: prompt }],
+      'Palauta VAIN JSON-array boolean-arvoja. Ei muuta tekstiä tai selityksiä.'
+    );
+
+    const text = (result.content || [])
+      .filter(b => b.type === 'text')
+      .map(b => b.text)
+      .join('');
+    const clean = text.replace(/```json|```/g, '').trim();
+
+    let booleans;
+    try { booleans = JSON.parse(clean); }
+    catch (e) {
+      const s = clean.indexOf('['), en = clean.lastIndexOf(']');
+      if (s !== -1 && en !== -1) booleans = JSON.parse(clean.slice(s, en + 1));
+      else { Logger.warn('filterRelevantItems parse failed, using all'); return items; }
+    }
+
+    if (!Array.isArray(booleans)) return items;
+
+    const filtered = items.filter((_, i) => booleans[i] === true);
+    Logger.info('Relevance filter result', {
+      total: items.length,
+      relevant: filtered.length,
+      kept: filtered.map(i => i.otsikko),
+      skipped: items.filter((_, i) => !booleans[i]).map(i => i.otsikko)
+    });
+    return filtered;
+  } catch (err) {
+    Logger.warn('filterRelevantItems failed, using all items', { error: err.message });
+    return items;
   }
 }
 
@@ -557,15 +611,22 @@ async function checkKaupunginhallitusPdfs() {
             : null;
 
           Logger.info('Processing meeting', { meetingId, kokousPvm });
-          const itemIds = await getMeetingItemIds(meetingId);
+          const allItems = await getMeetingItems(meetingId);
+          const relevantItems = await filterRelevantItems(allItems);
 
-          for (const itemId of itemIds) {
+          Logger.info('Processing relevant items', {
+            meetingId,
+            total: allItems.length,
+            relevant: relevantItems.length
+          });
+
+          for (const item of relevantItems) {
             try {
-              const existing = await supabaseGet(`talousdata?kokous_id=eq.${encodeURIComponent(itemId)}&select=id`);
-              if (existing.length > 0) { Logger.debug('Item already processed', { itemId }); continue; }
-              await parsePdfWithClaude(`https://kokkola10.oncloudos.com/kokous/${encodeURIComponent(itemId)}.PDF`, itemId, kokousPvm);
-              await sleep(5000); // 5 sekuntia kutsujen väliin rate limitin välttämiseksi
-            } catch (err) { Logger.error('Error processing item', { itemId, error: err.message }); }
+              const existing = await supabaseGet(`talousdata?kokous_id=eq.${encodeURIComponent(item.id)}&select=id`);
+              if (existing.length > 0) { Logger.debug('Item already processed', { itemId: item.id }); continue; }
+              await parsePdfWithClaude(`https://kokkola10.oncloudos.com/kokous/${encodeURIComponent(item.id)}.PDF`, item.id, kokousPvm);
+              await sleep(CONFIG.PDF_REQUEST_DELAY_MS);
+            } catch (err) { Logger.error('Error processing item', { itemId: item.id, error: err.message }); }
           }
         } catch (err) { Logger.error('Error processing meeting', { error: err.message }); }
       }
