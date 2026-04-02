@@ -556,7 +556,7 @@ async function checkKaupunginhallitusPdfs() {
             const existing = await supabaseGet(`talousdata?kokous_id=eq.${encodeURIComponent(itemId)}&select=id`);
             if (existing.length > 0) { Logger.debug('Item already processed', { itemId }); continue; }
             await parsePdfWithClaude(`https://kokkola10.oncloudos.com/kokous/${encodeURIComponent(itemId)}.PDF`, itemId, kokousPvm);
-            await sleep(CONFIG.PDF_REQUEST_DELAY_MS);
+            await sleep(5000); // 5 sekuntia kutsujen väliin rate limitin välttämiseksi
           } catch (err) { Logger.error('Error processing item', { itemId, error: err.message }); }
         }
       } catch (err) { Logger.error('Error processing meeting', { error: err.message }); }
