@@ -686,10 +686,95 @@ async function getStats() {
     result.tyottomyysKk   = uusinKk.replace('M', '/');
   } catch (e) { Logger.error('Stats tyottomyys error', e); }
 
+  // Nuorisotyöttömyys
+  try {
+    const metaData2 = await new Promise((resolve, reject) => {
+      https.get(TYO_URL, res => {
+        let data = '';
+        res.on('data', chunk => data += chunk);
+        res.on('end', () => { try { resolve(JSON.parse(data)); } catch (e) { reject(e); } });
+      }).on('error', reject);
+    });
+    const kuukaudet2 = metaData2.variables.find(v => v.code === 'Kuukausi').values;
+    const uusinKk2 = kuukaudet2[kuukaudet2.length - 1];
+    const edellinenKk2 = kuukaudet2[kuukaudet2.length - 13];
+    const nuorisoData = await fetchPxStat(TYO_URL, {
+      query: [
+        { code: 'Alue', selection: { filter: 'item', values: ['KU272'] } },
+        { code: 'Kuukausi', selection: { filter: 'item', values: [uusinKk2, edellinenKk2] } },
+        { code: 'Tiedot', selection: { filter: 'item', values: ['NUORTYOTOSUUS'] } }
+      ],
+      response: { format: 'json' }
+    });
+    result.nuorisotyottomyys = parseFloat(nuorisoData.data[0]?.values[0]);
+    result.nuorisotyottomyysPrev = parseFloat(nuorisoData.data[1]?.values[0]);
+  } catch (e) { Logger.error('Stats nuorisotyottomyys error', e); }
+
+  // Pitkäaikaistyöttömät
+  try {
+    const metaData3 = await new Promise((resolve, reject) => {
+      https.get(TYO_URL, res => {
+        let data = '';
+        res.on('data', chunk => data += chunk);
+        res.on('end', () => { try { resolve(JSON.parse(data)); } catch (e) { reject(e); } });
+      }).on('error', reject);
+    });
+    const kuukaudet3 = metaData3.variables.find(v => v.code === 'Kuukausi').values;
+    const uusinKk3 = kuukaudet3[kuukaudet3.length - 1];
+    const pitkData = await fetchPxStat(TYO_URL, {
+      query: [
+        { code: 'Alue', selection: { filter: 'item', values: ['KU272'] } },
+        { code: 'Kuukausi', selection: { filter: 'item', values: [uusinKk3] } },
+        { code: 'Tiedot', selection: { filter: 'item', values: ['PITKTYOT'] } }
+      ],
+      response: { format: 'json' }
+    });
+    result.pitkaikaistyottomat = parseInt(pitkData.data[0]?.values[0]);
+  } catch (e) { Logger.error('Stats pitkaikaistyottomat error', e); }
+
   statsCache     = result;
   statsCacheTime = now;
   Logger.info('Stats cached', result);
+
+  // Tallenna Supabaseen kerran vuorokaudessa
+  try {
+    const today = new Date().toISOString().split('T')[0];
+    const existing = await supabaseGet(`stats_history?pvm=eq.${today}&select=id`);
+    if (existing.length === 0) {
+      await supabaseRequest('stats_history', 'POST', {
+        pvm: today,
+        vaesto: result.vaesto || null,
+        tyottomyys: result.tyottomyys || null,
+        nuoret: result.nuoret || null,
+        nuorisotyottomyys: result.nuorisotyottomyys || null,
+        pitkaikaistyottomat: result.pitkaikaistyottomat || null,
+      });
+      Logger.info('Stats history saved', { pvm: today });
+    }
+  } catch (e) { Logger.error('Stats history save error', e); }
+
   return result;
+}
+
+// ============================================================================
+// REQUEST UTILITIES
+// ============================================================================
+
+function readBody(req) {
+  return new Promise((resolve, reject) => {
+    let body = '';
+    req.on('data', chunk => body += chunk.toString());
+    req.on('end', () => {
+      try { resolve(body ? JSON.parse(body) : {}); }
+      catch (e) { reject(new Error('Invalid JSON')); }
+    });
+    req.on('error', reject);
+  });
+}
+
+function checkAdminKey(req) {
+  const key = req.headers['authorization']?.replace('Bearer ', '');
+  return key && key === process.env.ADMIN_API_KEY;
 }
 
 // ============================================================================
@@ -762,6 +847,23 @@ const server = http.createServer(async (req, res) => {
       return;
     }
 
+    if (req.url.startsWith('/stats/history')) {
+      try {
+        const urlObj = new URL(req.url, 'http://localhost');
+        const months = parseInt(urlObj.searchParams.get('months')) || 12;
+        const fromDate = new Date();
+        fromDate.setMonth(fromDate.getMonth() - months);
+        const fromStr = fromDate.toISOString().split('T')[0];
+        const data = await supabaseGet(`stats_history?pvm=gte.${fromStr}&order=pvm.asc`);
+        res.statusCode = 200;
+        res.end(JSON.stringify(data));
+      } catch (err) {
+        Logger.error('stats/history error', err);
+        sendError(res, 500, 'Failed to fetch stats history');
+      }
+      return;
+    }
+
     if (req.url === '/stats') {
       try {
         const data = await getStats();
@@ -783,6 +885,74 @@ const server = http.createServer(async (req, res) => {
       } catch (err) {
         Logger.error('News fetch error', { aihe, error: err.message });
         sendError(res, 500, 'Failed to fetch news');
+      }
+      return;
+    }
+
+    if (req.url === '/economic-data') {
+      if (req.method === 'GET') {
+        try {
+          const data = await supabaseGet('taloustilanne?order=id.desc&limit=1');
+          res.statusCode = 200;
+          res.end(JSON.stringify(data[0] || {}));
+        } catch (err) {
+          Logger.error('economic-data GET error', err);
+          sendError(res, 500, 'Failed to fetch economic data');
+        }
+        return;
+      }
+      if (req.method === 'POST') {
+        if (!checkAdminKey(req)) { sendError(res, 401, 'Unauthorized'); return; }
+        try {
+          const body = await readBody(req);
+          await supabaseRequest('taloustilanne', 'POST', body);
+          res.statusCode = 201;
+          res.end(JSON.stringify({ message: 'Saved' }));
+        } catch (err) {
+          Logger.error('economic-data POST error', err);
+          sendError(res, 500, 'Failed to save economic data');
+        }
+        return;
+      }
+    }
+
+    if (req.url === '/forecasts') {
+      if (req.method === 'GET') {
+        try {
+          const data = await supabaseGet('ennusteet?order=id.desc&limit=1');
+          res.statusCode = 200;
+          res.end(JSON.stringify(data[0] || {}));
+        } catch (err) {
+          Logger.error('forecasts GET error', err);
+          sendError(res, 500, 'Failed to fetch forecasts');
+        }
+        return;
+      }
+      if (req.method === 'POST') {
+        if (!checkAdminKey(req)) { sendError(res, 401, 'Unauthorized'); return; }
+        try {
+          const body = await readBody(req);
+          await supabaseRequest('ennusteet', 'POST', body);
+          res.statusCode = 201;
+          res.end(JSON.stringify({ message: 'Saved' }));
+        } catch (err) {
+          Logger.error('forecasts POST error', err);
+          sendError(res, 500, 'Failed to save forecasts');
+        }
+        return;
+      }
+    }
+
+    if (req.url.startsWith('/talousdata')) {
+      try {
+        const urlObj = new URL(req.url, 'http://localhost');
+        const limit = parseInt(urlObj.searchParams.get('limit')) || 10;
+        const data = await supabaseGet(`talousdata?order=kokous_pvm.desc&limit=${limit}`);
+        res.statusCode = 200;
+        res.end(JSON.stringify(data));
+      } catch (err) {
+        Logger.error('talousdata fetch error', err);
+        sendError(res, 500, 'Failed to fetch talousdata');
       }
       return;
     }
