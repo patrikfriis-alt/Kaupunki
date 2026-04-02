@@ -273,13 +273,59 @@ async function supabaseBatchRequest(path, method, items) {
 // SUPABASE SAVE OPERATIONS
 // ============================================================================
 
+async function scoreDecisions(items) {
+  if (!ANTHROPIC_KEY || !items.length) return items.map(i => ({ ...i, relevantti: null }));
+  try {
+    const prompt = `Arvioi onko kaupunginvaltuuston tai -hallituksen kokousasia relevantti kaupunkilaiselle.
+
+Relevantti (true): päätökset jotka vaikuttavat palveluihin, talouteen, investointeihin, maankäyttöön, henkilöstöön, hankintoihin tai strategiaan
+Ei relevantti (false): proseduraaliset asiat kuten kokouksen avaus, pöytäkirjan tarkastajat, tiedoksiannot, vaalitulokset, laillisuustoteamukset
+
+Otsikot:
+${items.map((item, i) => `${i}. ${item.otsikko}`).join('\n')}
+
+Palauta VAIN JSON-array boolean-arvoja, yksi per otsikko: [true, false, ...]
+Ei muuta tekstiä.`;
+
+    const result = await callClaude(
+      [{ role: 'user', content: prompt }],
+      'Palauta VAIN JSON-array boolean-arvoja.'
+    );
+
+    const text = (result.content || []).filter(b => b.type === 'text').map(b => b.text).join('');
+    const clean = text.replace(/```json|```/g, '').trim();
+    let booleans;
+    try { booleans = JSON.parse(clean); }
+    catch (e) {
+      const s = clean.indexOf('['), en = clean.lastIndexOf(']');
+      if (s !== -1 && en !== -1) booleans = JSON.parse(clean.slice(s, en + 1));
+      else return items.map(i => ({ ...i, relevantti: null }));
+    }
+
+    return items.map((item, i) => ({
+      ...item,
+      relevantti: typeof booleans[i] === 'boolean' ? booleans[i] : null
+    }));
+  } catch (err) {
+    Logger.warn('scoreDecisions failed', { error: err.message });
+    return items.map(i => ({ ...i, relevantti: null }));
+  }
+}
+
 async function saveToSupabase(items, tyyppi) {
   if (!SUPABASE_URL || !SUPABASE_SERVICE_KEY) {
     Logger.warn('Supabase not configured, skipping save');
     return;
   }
 
-  const processedItems = items.map(item => {
+  let scoredItems = items;
+  if (['paatos', 'kokous'].includes(tyyppi)) {
+    scoredItems = await scoreDecisions(items);
+    const relevant = scoredItems.filter(i => i.relevantti === true).length;
+    Logger.info('Scored decisions', { total: items.length, relevant, tyyppi });
+  }
+
+  const processedItems = scoredItems.map(item => {
     let julkaisija = 'Kokkola';
     let otsikko = item.otsikko;
     if (otsikko.includes(' / ')) {
@@ -292,7 +338,7 @@ async function saveToSupabase(items, tyyppi) {
       const d = new Date(item.julkaistu);
       if (!isNaN(d.getTime())) julkaistu = d.toISOString().split('T')[0];
     }
-    return { ulkoinen_id: item.ulkoinen_id, otsikko, kuvaus: item.kuvaus, julkaisija, linkki: item.linkki, julkaistu, tyyppi };
+    return { ulkoinen_id: item.ulkoinen_id, otsikko, kuvaus: item.kuvaus, julkaisija, linkki: item.linkki, julkaistu, tyyppi, relevantti: item.relevantti ?? null };
   });
 
   try {
