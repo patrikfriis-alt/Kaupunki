@@ -504,12 +504,19 @@ async function parsePdfWithClaude(pdfUrl, kokousId, kokousPvm) {
 
 async function getMeetingItemIds(meetingId) {
   try {
-    const buffer = await fetchBuffer(`https://kokkola10.oncloudos.com/cgi/DREQUEST.PHP?page=meeting&id=${encodeURIComponent(meetingId)}`);
+    const buffer = await fetchBuffer(
+      `https://kokkola10.oncloudos.com/cgi/DREQUEST.PHP?page=meeting&id=${encodeURIComponent(meetingId)}`
+    );
+    // Sivu on ISO-8859-1 — decode oikein
     const html = buffer.toString('latin1');
-    const regex = /page=meetingitem&amp;id=(\d+-\d+)/g;
+
+    // Korjattu regex: matchaa sekä &id= että &amp;id=
+    const regex = /page=meetingitem&(?:amp;)?id=([\d]+-[\d]+)/g;
     const ids = new Set();
     let match;
     while ((match = regex.exec(html)) !== null) ids.add(match[1]);
+
+    Logger.info('Found meeting item IDs', { meetingId, count: ids.size });
     return Array.from(ids);
   } catch (err) {
     Logger.error('getMeetingItemIds error', { meetingId, error: err.message });
