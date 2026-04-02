@@ -10,7 +10,7 @@ const CONFIG = {
   CLAUDE_MODEL: process.env.CLAUDE_MODEL || 'claude-haiku-4-5-20251001',
   CLAUDE_MAX_TOKENS: parseInt(process.env.CLAUDE_MAX_TOKENS) || 2048,
   PDF_MIN_SIZE: parseInt(process.env.PDF_MIN_SIZE) || 1000,
-  PDF_REQUEST_DELAY_MS: parseInt(process.env.PDF_REQUEST_DELAY_MS) || 1500,
+  PDF_REQUEST_DELAY_MS: parseInt(process.env.PDF_REQUEST_DELAY_MS) || 20000,
   NEWS_SYNC_INTERVAL_MS: parseInt(process.env.NEWS_SYNC_INTERVAL_MS) || 24 * 60 * 60 * 1000,
   FEED_SYNC_INTERVAL_MS: parseInt(process.env.FEED_SYNC_INTERVAL_MS) || 60 * 60 * 1000,
   HTTP_TIMEOUT_MS: parseInt(process.env.HTTP_TIMEOUT_MS) || 30000,
